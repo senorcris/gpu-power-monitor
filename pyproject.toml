@@ -1,0 +1,18 @@
+[project]
+name = "gpu-power-monitor"
+version = "0.1.0"
+description = "Linux power monitoring for ASUS ROG RTX 5090 Astral LC 12V-2x6 connector via IT8915FN I2C"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.89.0",
+    "smbus2>=0.4.3",
+    "pynvml>=11.5.0",
+]
+
+[project.scripts]
+gpu-power-monitor = "gpu_power_monitor.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
