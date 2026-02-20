@@ -124,6 +124,22 @@ class TestMonitorSnapshotSerialization:
         assert restored.processes == []
 
 
+class TestGpuStatsThrottleReasons:
+    def test_default_throttle_reasons_zero(self):
+        g = GpuStats()
+        assert g.throttle_reasons == 0
+
+    def test_throttle_reasons_round_trip(self):
+        gpu = GpuStats(
+            power_draw=100.0, power_limit=350.0, temperature=72,
+            name="RTX 5090", throttle_reasons=0x44,
+        )
+        snap = MonitorSnapshot(connector=None, gpu=gpu, timestamp=6000.0)
+        json_str = snap.to_json()
+        restored = MonitorSnapshot.from_json(json_str)
+        assert restored.gpu.throttle_reasons == 0x44
+
+
 class TestGpuProcess:
     def test_creation_with_defaults(self):
         p = GpuProcess(pid=42, name="test", vram_used=100)

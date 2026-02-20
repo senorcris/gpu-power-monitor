@@ -7,7 +7,8 @@ from typing import Optional
 from .config import (
     I2C_BUS, I2C_ADDRESS, I2C_REGISTER,
     REFRESH_INTERVAL, CURRENT_WARN_THRESHOLD, CURRENT_ALERT_THRESHOLD,
-    get_socket_path,
+    VOLTAGE_MIN, VOLTAGE_MAX, TEMP_WARN_THRESHOLD, TEMP_ALERT_THRESHOLD,
+    get_socket_path, get_gpu_profile,
 )
 from .i2c import IT8915Reader
 from .gpu import GpuMonitor
@@ -17,16 +18,52 @@ logger = logging.getLogger(__name__)
 
 
 def _build_alerts(snapshot: MonitorSnapshot) -> list[str]:
-    """Check pin currents against thresholds, return alert strings."""
+    """Check pin currents, voltages, and temps against thresholds."""
     alerts = []
-    if snapshot.connector is None:
-        return alerts
-    for pin in snapshot.connector.pins:
-        amps = pin.current
-        if amps >= CURRENT_ALERT_THRESHOLD:
-            alerts.append(f"ALERT: {pin.label} current {amps:.2f}A exceeds {CURRENT_ALERT_THRESHOLD}A limit")
-        elif amps >= CURRENT_WARN_THRESHOLD:
-            alerts.append(f"WARN: {pin.label} current {amps:.2f}A exceeds {CURRENT_WARN_THRESHOLD}A warning")
+    if snapshot.connector is not None:
+        for pin in snapshot.connector.pins:
+            amps = pin.current
+            if amps >= CURRENT_ALERT_THRESHOLD:
+                alerts.append(f"ALERT: {pin.label} current {amps:.2f}A exceeds {CURRENT_ALERT_THRESHOLD}A limit")
+            elif amps >= CURRENT_WARN_THRESHOLD:
+                alerts.append(f"WARN: {pin.label} current {amps:.2f}A exceeds {CURRENT_WARN_THRESHOLD}A warning")
+            volts = pin.voltage
+            if volts > 0 and volts < VOLTAGE_MIN:
+                alerts.append(f"ALERT: {pin.label} voltage {volts:.2f}V below {VOLTAGE_MIN}V minimum")
+            elif volts > VOLTAGE_MAX:
+                alerts.append(f"ALERT: {pin.label} voltage {volts:.2f}V above {VOLTAGE_MAX}V maximum")
+    if snapshot.gpu is not None:
+        temp = snapshot.gpu.temperature
+        if temp >= TEMP_ALERT_THRESHOLD:
+            alerts.append(f"ALERT: GPU temperature {temp}C exceeds {TEMP_ALERT_THRESHOLD}C limit")
+        elif temp >= TEMP_WARN_THRESHOLD:
+            alerts.append(f"WARN: GPU temperature {temp}C exceeds {TEMP_WARN_THRESHOLD}C warning")
+
+        # Model-specific power thresholds
+        if snapshot.gpu.name:
+            power_profile, _ = get_gpu_profile(snapshot.gpu.name)
+            pw = snapshot.gpu.power_draw
+            if pw >= power_profile["power_alarm_watts"]:
+                alerts.append(
+                    f"ALERT: GPU power {pw:.0f}W exceeds {power_profile['power_alarm_watts']}W alarm threshold"
+                )
+            elif pw >= power_profile["power_warn_watts"]:
+                alerts.append(
+                    f"WARN: GPU power {pw:.0f}W exceeds {power_profile['power_warn_watts']}W warning threshold"
+                )
+
+    # Cross-validation: connector power vs GPU reported power
+    if snapshot.connector is not None and snapshot.gpu is not None:
+        connector_power = snapshot.connector.total_power
+        gpu_power = snapshot.gpu.power_draw
+        if connector_power > 50 and gpu_power > 50:
+            diff = abs(connector_power - gpu_power)
+            avg = (connector_power + gpu_power) / 2
+            if diff / avg > 0.20:
+                alerts.append(
+                    f"WARN: Connector power ({connector_power:.0f}W) vs GPU reported ({gpu_power:.0f}W) "
+                    f"differ by {diff:.0f}W ({diff/avg*100:.0f}%) - possible measurement discrepancy"
+                )
     return alerts
 
 

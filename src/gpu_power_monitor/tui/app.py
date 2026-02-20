@@ -16,12 +16,32 @@ from textual_plotext import PlotextPlot
 
 from ..config import (
     GRAPH_HISTORY_LENGTH, I2C_BUS, I2C_ADDRESS, I2C_REGISTER,
-    REFRESH_INTERVAL, NUM_PINS, get_socket_path,
+    REFRESH_INTERVAL, REFRESH_RATE, NUM_PINS, get_socket_path, get_gpu_profile,
 )
 from ..protocol import MonitorSnapshot
 from .widgets import PinGauge, StressTestModal, _STRESS_PRESETS
 
 logger = logging.getLogger(__name__)
+
+THROTTLE_REASONS = {
+    0x0000000000000001: "GpuIdle",
+    0x0000000000000002: "AppClkSetting",
+    0x0000000000000004: "SwPowerCap",
+    0x0000000000000008: "HwSlowdown",
+    0x0000000000000010: "SyncBoost",
+    0x0000000000000020: "SwThermalSlowdown",
+    0x0000000000000040: "HwThermalSlowdown",
+    0x0000000000000080: "HwPowerBrakeSlowdown",
+}
+
+
+def _decode_throttle_reasons(bitmask: int) -> list[str]:
+    """Decode NVML throttle reasons bitmask into human-readable labels."""
+    reasons = []
+    for bit, name in THROTTLE_REASONS.items():
+        if bitmask & bit:
+            reasons.append(name)
+    return reasons
 
 
 @dataclass
@@ -83,6 +103,9 @@ class GpuPowerMonitorApp(App):
     #vram-graph {
         height: 8;
     }
+    #temp-graph {
+        height: 8;
+    }
     #alert-log {
         height: 1fr;
         border: solid $accent;
@@ -103,9 +126,12 @@ class GpuPowerMonitorApp(App):
         self._i2c_register = register if register is not None else I2C_REGISTER
         self._power_history: deque[float] = deque(maxlen=GRAPH_HISTORY_LENGTH)
         self._vram_history: deque[float] = deque(maxlen=GRAPH_HISTORY_LENGTH)
+        self._temp_history: deque[float] = deque(maxlen=GRAPH_HISTORY_LENGTH)
+        self._thermal_profile: dict | None = None
         self._kill_confirm_pid: int | None = None
         self._stress_tests: dict[int, _StressInfo] = {}  # pid -> info
         self._last_processes: list = []  # cache last known process list
+        self._last_alerts: set[str] = set()  # for alert deduplication
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -120,6 +146,7 @@ class GpuPowerMonitorApp(App):
                 yield Static("GPU: --", id="gpu-stats")
                 yield PlotextPlot(id="power-graph")
                 yield PlotextPlot(id="vram-graph")
+                yield PlotextPlot(id="temp-graph")
                 yield RichLog(id="alert-log", markup=True, wrap=True)
         yield Static("", id="kill-confirm")
         yield Footer()
@@ -165,7 +192,10 @@ class GpuPowerMonitorApp(App):
         # Direct polling fallback
         from ..i2c import IT8915Reader
         from ..gpu import GpuMonitor
-        from ..config import CURRENT_ALERT_THRESHOLD, CURRENT_WARN_THRESHOLD
+        from ..config import (
+            CURRENT_ALERT_THRESHOLD, CURRENT_WARN_THRESHOLD,
+            VOLTAGE_MIN, VOLTAGE_MAX, TEMP_WARN_THRESHOLD, TEMP_ALERT_THRESHOLD,
+        )
 
         i2c_reader = IT8915Reader(
             bus=self._i2c_bus,
@@ -210,6 +240,51 @@ class GpuPowerMonitorApp(App):
                             snap.alerts.append(
                                 f"WARN: {pin.label} current {pin.current:.2f}A exceeds {CURRENT_WARN_THRESHOLD}A warning"
                             )
+                        volts = pin.voltage
+                        if volts > 0 and volts < VOLTAGE_MIN:
+                            snap.alerts.append(
+                                f"ALERT: {pin.label} voltage {volts:.2f}V below {VOLTAGE_MIN}V minimum"
+                            )
+                        elif volts > VOLTAGE_MAX:
+                            snap.alerts.append(
+                                f"ALERT: {pin.label} voltage {volts:.2f}V above {VOLTAGE_MAX}V maximum"
+                            )
+                if gpu:
+                    temp = gpu.temperature
+                    if temp >= TEMP_ALERT_THRESHOLD:
+                        snap.alerts.append(
+                            f"ALERT: GPU temperature {temp}C exceeds {TEMP_ALERT_THRESHOLD}C limit"
+                        )
+                    elif temp >= TEMP_WARN_THRESHOLD:
+                        snap.alerts.append(
+                            f"WARN: GPU temperature {temp}C exceeds {TEMP_WARN_THRESHOLD}C warning"
+                        )
+
+                    # Model-specific power thresholds
+                    if gpu.name:
+                        power_profile, _ = get_gpu_profile(gpu.name)
+                        pw = gpu.power_draw
+                        if pw >= power_profile["power_alarm_watts"]:
+                            snap.alerts.append(
+                                f"ALERT: GPU power {pw:.0f}W exceeds {power_profile['power_alarm_watts']}W alarm threshold"
+                            )
+                        elif pw >= power_profile["power_warn_watts"]:
+                            snap.alerts.append(
+                                f"WARN: GPU power {pw:.0f}W exceeds {power_profile['power_warn_watts']}W warning threshold"
+                            )
+
+                # Cross-validation: connector power vs GPU reported power
+                if connector and gpu:
+                    connector_power = connector.total_power
+                    gpu_power = gpu.power_draw
+                    if connector_power > 50 and gpu_power > 50:
+                        diff = abs(connector_power - gpu_power)
+                        avg = (connector_power + gpu_power) / 2
+                        if diff / avg > 0.20:
+                            snap.alerts.append(
+                                f"WARN: Connector power ({connector_power:.0f}W) vs GPU reported ({gpu_power:.0f}W) "
+                                f"differ by {diff:.0f}W ({diff/avg*100:.0f}%) - possible measurement discrepancy"
+                            )
 
                 self.call_from_thread(self._apply_snapshot, snap)
                 time.sleep(REFRESH_INTERVAL)
@@ -224,6 +299,26 @@ class GpuPowerMonitorApp(App):
         except Exception:
             # Guard against NoMatches during screen transitions
             pass
+
+    def _render_graph(
+        self, widget_id: str, history: deque, title: str, ylabel: str,
+    ) -> None:
+        """Render a PlotextPlot with a fixed time-based X axis (seconds ago)."""
+        plot_widget = self.query_one(widget_id, PlotextPlot)
+        p = plot_widget.plt
+        p.clear_data()
+        p.clear_figure()
+
+        # Build fixed X axis: -60s ... 0s, right-aligned to current data
+        max_seconds = GRAPH_HISTORY_LENGTH / REFRESH_RATE
+        n = len(history)
+        x = [-(max_seconds - i / REFRESH_RATE) for i in range(n)]
+        p.plot(x, list(history), marker="braille")
+        p.xlim(-max_seconds, 0)
+        p.xlabel("seconds ago")
+        p.title(title)
+        p.ylabel(ylabel)
+        plot_widget.refresh()
 
     def _apply_snapshot_inner(self, snap: MonitorSnapshot) -> None:
         if snap.connector:
@@ -246,11 +341,32 @@ class GpuPowerMonitorApp(App):
             g = snap.gpu
             if g.name:
                 self.sub_title = g.name
+                if self._thermal_profile is None:
+                    _, self._thermal_profile = get_gpu_profile(g.name)
             vram_pct = round(g.vram_used / g.vram_total * 100) if g.vram_total else 0
+
+            # Build throttle indicator
+            throttle_str = ""
+            if g.throttle_reasons:
+                reasons = _decode_throttle_reasons(g.throttle_reasons)
+                active = [r for r in reasons if r != "GpuIdle"]
+                if active:
+                    short = []
+                    for r in active:
+                        if "Thermal" in r:
+                            short.append("Thermal")
+                        elif "Power" in r or "PowerBrake" in r:
+                            short.append("Power")
+                        elif r == "HwSlowdown":
+                            short.append("HW")
+                        else:
+                            short.append(r)
+                    throttle_str = f"  THROTTLE: {','.join(dict.fromkeys(short))}"
+
             gpu_text = (
                 f"Power {g.power_draw:.0f}/{g.power_limit:.0f}W  |  "
                 f"Temp {g.temperature}C  Fan {g.fan_speed}%  |  "
-                f"GPU {g.util_gpu}%  Mem {g.util_memory}%\n"
+                f"GPU {g.util_gpu}%  Mem {g.util_memory}%{throttle_str}\n"
                 f"Core {g.clock_graphics}MHz  Mem {g.clock_memory}MHz  |  "
                 f"VRAM {g.vram_used}/{g.vram_total}MB ({vram_pct}%)"
             )
@@ -258,24 +374,21 @@ class GpuPowerMonitorApp(App):
 
             # Feed line graphs
             self._power_history.append(g.power_draw)
-            power_plot = self.query_one("#power-graph", PlotextPlot)
-            plt = power_plot.plt
-            plt.clear_data()
-            plt.clear_figure()
-            plt.plot(list(self._power_history), marker="braille")
-            plt.title(f"Power: {g.power_draw:.0f}W")
-            plt.ylabel("W")
-            power_plot.refresh()
-
             self._vram_history.append(float(g.vram_used))
-            vram_plot = self.query_one("#vram-graph", PlotextPlot)
-            plt2 = vram_plot.plt
-            plt2.clear_data()
-            plt2.clear_figure()
-            plt2.plot(list(self._vram_history), marker="braille")
-            plt2.title(f"VRAM: {g.vram_used} / {g.vram_total} MB")
-            plt2.ylabel("MB")
-            vram_plot.refresh()
+            self._temp_history.append(float(g.temperature))
+
+            self._render_graph(
+                "#power-graph", self._power_history,
+                f"Power: {g.power_draw:.0f}W", "W",
+            )
+            self._render_graph(
+                "#vram-graph", self._vram_history,
+                f"VRAM: {g.vram_used} / {g.vram_total} MB", "MB",
+            )
+            temp_title = f"Temp: {g.temperature}C"
+            if self._thermal_profile:
+                temp_title += f" (warn {self._thermal_profile['temp_warn']}C)"
+            self._render_graph("#temp-graph", self._temp_history, temp_title, "C")
 
         # Update process table — merge nvml/nvidia-smi data with tracked stress tests
         # Cache non-empty process lists so we don't flicker when nvidia-smi is slow
@@ -339,13 +452,18 @@ class GpuPowerMonitorApp(App):
                     col_key = table.ordered_columns[col_idx].key
                     table.update_cell(row_key, col_key, val)
 
-        if snap.alerts:
+        # Deduplicate alerts: only log alerts that weren't in the previous cycle
+        current_alerts = set(snap.alerts)
+        new_alerts = current_alerts - self._last_alerts
+        self._last_alerts = current_alerts
+        if new_alerts:
             log = self.query_one("#alert-log", RichLog)
             from datetime import datetime
             ts = datetime.fromtimestamp(snap.timestamp).strftime("%H:%M:%S")
             for alert in snap.alerts:
-                color = "red" if alert.startswith("ALERT") else "yellow"
-                log.write(f"[{color}][{ts}] {alert}[/{color}]")
+                if alert in new_alerts:
+                    color = "red" if alert.startswith("ALERT") else "yellow"
+                    log.write(f"[{color}][{ts}] {alert}[/{color}]")
 
     def action_clear_log(self) -> None:
         self.query_one("#alert-log", RichLog).clear()

@@ -87,6 +87,12 @@ class GpuMonitor:
             if isinstance(name, bytes):
                 name = name.decode("utf-8")
 
+            # Throttle reasons
+            try:
+                throttle_reasons = pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(self._handle)
+            except (pynvml.NVMLError, AttributeError):
+                throttle_reasons = 0
+
             return GpuStats(
                 power_draw=round(power_draw, 1),
                 power_limit=round(power_limit, 1),
@@ -99,6 +105,7 @@ class GpuMonitor:
                 vram_used=vram_used,
                 vram_total=vram_total,
                 name=name,
+                throttle_reasons=throttle_reasons,
             )
         except pynvml.NVMLError as e:
             logger.warning(f"Error reading GPU stats: {e}")

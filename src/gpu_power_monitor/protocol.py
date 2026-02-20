@@ -59,6 +59,7 @@ class GpuStats:
     vram_used: int = 0  # MB
     vram_total: int = 0  # MB
     name: str = ""
+    throttle_reasons: int = 0  # bitmask from nvmlDeviceGetCurrentClocksThrottleReasons
 
 
 @dataclass
