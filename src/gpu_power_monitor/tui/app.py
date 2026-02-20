@@ -6,6 +6,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Header, Static, RichLog
+from textual import work
 
 from ..config import (
     I2C_BUS, I2C_ADDRESS, I2C_REGISTER,
@@ -54,9 +55,9 @@ class GpuPowerMonitorApp(App):
 
     def __init__(self, bus=None, address=None, register=None, **kwargs):
         super().__init__(**kwargs)
-        self._bus = bus if bus is not None else I2C_BUS
-        self._address = address if address is not None else I2C_ADDRESS
-        self._register = register if register is not None else I2C_REGISTER
+        self._i2c_bus = bus if bus is not None else I2C_BUS
+        self._i2c_address = address if address is not None else I2C_ADDRESS
+        self._i2c_register = register if register is not None else I2C_REGISTER
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -70,42 +71,49 @@ class GpuPowerMonitorApp(App):
     def on_mount(self) -> None:
         self._start_reader()
 
+    @work(exclusive=True, thread=True)
     def _start_reader(self) -> None:
-        """Start background data reader, trying daemon socket first."""
-        self.run_worker(self._read_loop, exclusive=True)
+        """Background thread: try daemon socket, fall back to direct reads."""
+        import time
 
-    async def _read_loop(self) -> None:
-        """Try connecting to daemon socket; fall back to direct reads."""
         socket_path = get_socket_path()
+
+        # Try daemon socket first
         try:
-            reader, writer = await asyncio.open_unix_connection(socket_path)
+            import socket as sock_mod
+            s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            s.connect(socket_path)
             logger.info("Connected to daemon socket")
+            buf = b""
             try:
-                await self._stream_from_socket(reader)
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if line:
+                            try:
+                                snap = MonitorSnapshot.from_json(line.decode())
+                                self.call_from_thread(self._apply_snapshot, snap)
+                            except Exception as e:
+                                logger.debug(f"Bad snapshot: {e}")
             finally:
-                writer.close()
+                s.close()
         except (OSError, ConnectionRefusedError, FileNotFoundError):
             logger.info("Daemon not available, falling back to direct reads")
-            await self._poll_direct()
 
-    async def _stream_from_socket(self, reader: asyncio.StreamReader) -> None:
-        """Read NDJSON snapshots from the daemon socket."""
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            try:
-                snap = MonitorSnapshot.from_json(line.decode())
-                self.call_from_thread(self._apply_snapshot, snap)
-            except Exception as e:
-                logger.debug(f"Bad snapshot: {e}")
-
-    async def _poll_direct(self) -> None:
-        """Poll I2C + GPU directly when daemon is not running."""
+        # Direct polling fallback
         from ..i2c import IT8915Reader
         from ..gpu import GpuMonitor
+        from ..config import CURRENT_ALERT_THRESHOLD, CURRENT_WARN_THRESHOLD
 
-        i2c_reader = IT8915Reader(bus=self._bus, address=self._address, register=self._register)
+        i2c_reader = IT8915Reader(
+            bus=self._i2c_bus,
+            address=self._i2c_address,
+            register=self._i2c_register,
+        )
         gpu_mon = GpuMonitor()
 
         try:
@@ -117,46 +125,37 @@ class GpuPowerMonitorApp(App):
         except Exception as e:
             logger.warning(f"Could not open GPU monitor: {e}")
 
-        loop = asyncio.get_running_loop()
         try:
             while True:
-                snap = await loop.run_in_executor(None, self._do_direct_read, i2c_reader, gpu_mon)
+                try:
+                    connector = i2c_reader.read_pins()
+                except Exception:
+                    connector = None
+                try:
+                    gpu = gpu_mon.read_stats()
+                except Exception:
+                    gpu = None
+
+                snap = MonitorSnapshot(connector=connector, gpu=gpu)
+                if connector:
+                    for pin in connector.pins:
+                        if pin.current >= CURRENT_ALERT_THRESHOLD:
+                            snap.alerts.append(
+                                f"ALERT: {pin.label} current {pin.current:.2f}A exceeds {CURRENT_ALERT_THRESHOLD}A limit"
+                            )
+                        elif pin.current >= CURRENT_WARN_THRESHOLD:
+                            snap.alerts.append(
+                                f"WARN: {pin.label} current {pin.current:.2f}A exceeds {CURRENT_WARN_THRESHOLD}A warning"
+                            )
+
                 self.call_from_thread(self._apply_snapshot, snap)
-                await asyncio.sleep(REFRESH_INTERVAL)
+                time.sleep(REFRESH_INTERVAL)
         finally:
             i2c_reader.close()
             gpu_mon.close()
 
-    @staticmethod
-    def _do_direct_read(i2c_reader, gpu_mon) -> MonitorSnapshot:
-        from ..config import CURRENT_ALERT_THRESHOLD, CURRENT_WARN_THRESHOLD
-
-        try:
-            connector = i2c_reader.read_pins()
-        except Exception:
-            connector = None
-
-        try:
-            gpu = gpu_mon.read_stats()
-        except Exception:
-            gpu = None
-
-        snap = MonitorSnapshot(connector=connector, gpu=gpu)
-        if connector:
-            for pin in connector.pins:
-                if pin.current >= CURRENT_ALERT_THRESHOLD:
-                    snap.alerts.append(
-                        f"ALERT: {pin.label} current {pin.current:.2f}A exceeds {CURRENT_ALERT_THRESHOLD}A limit"
-                    )
-                elif pin.current >= CURRENT_WARN_THRESHOLD:
-                    snap.alerts.append(
-                        f"WARN: {pin.label} current {pin.current:.2f}A exceeds {CURRENT_WARN_THRESHOLD}A warning"
-                    )
-        return snap
-
     def _apply_snapshot(self, snap: MonitorSnapshot) -> None:
-        """Update all widgets from a MonitorSnapshot. Called on the main thread."""
-        # Update pin gauges
+        """Update all widgets from a MonitorSnapshot."""
         if snap.connector:
             for pin in snap.connector.pins:
                 try:
@@ -165,7 +164,6 @@ class GpuPowerMonitorApp(App):
                 except Exception:
                     pass
 
-            # Summary line
             total_a = snap.connector.total_current
             total_w = snap.connector.total_power
             voltages = [p.voltage for p in snap.connector.pins if p.voltage > 0]
@@ -175,7 +173,6 @@ class GpuPowerMonitorApp(App):
                 f"Total: {total_a:.2f} A  {total_w:.1f} W  |  Avg Voltage: {avg_v:.3f} V"
             )
 
-        # GPU stats line
         if snap.gpu:
             g = snap.gpu
             gpu_text = (
@@ -186,7 +183,6 @@ class GpuPowerMonitorApp(App):
             )
             self.query_one("#gpu-stats", Static).update(gpu_text)
 
-        # Alerts
         if snap.alerts:
             log = self.query_one("#alert-log", RichLog)
             from datetime import datetime

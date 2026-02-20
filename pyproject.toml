@@ -5,7 +5,7 @@ description = "Linux power monitoring for ASUS ROG RTX 5090 Astral LC 12V-2x6 co
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "textual>=0.89.0",
+    "textual>=0.89.0,<1.0",
     "smbus2>=0.4.3",
     "pynvml>=11.5.0",
 ]
