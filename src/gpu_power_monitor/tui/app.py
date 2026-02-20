@@ -74,13 +74,14 @@ class GpuPowerMonitorApp(App):
     #left-panel {
         width: 1fr;
         min-width: 36;
+        margin-right: 1;
     }
     #right-panel {
         width: 2fr;
     }
     #process-table {
         height: 1fr;
-        border: solid $accent;
+        border: round $accent;
     }
     #pin-row {
         height: auto;
@@ -98,20 +99,15 @@ class GpuPowerMonitorApp(App):
         height: 2;
         width: 100%;
         text-align: center;
-        border: solid $success;
+        padding: 0 1;
     }
-    #power-graph {
+    #power-graph, #vram-graph, #temp-graph {
         height: 8;
-    }
-    #vram-graph {
-        height: 8;
-    }
-    #temp-graph {
-        height: 8;
+        min-width: 40;
     }
     #alert-log {
         height: 1fr;
-        border: solid $accent;
+        border: round $accent;
     }
     #kill-confirm {
         height: 1;
@@ -131,6 +127,7 @@ class GpuPowerMonitorApp(App):
         self._vram_history: deque[float] = deque(maxlen=GRAPH_HISTORY_LENGTH)
         self._temp_history: deque[float] = deque(maxlen=GRAPH_HISTORY_LENGTH)
         self._thermal_profile: dict | None = None
+        self._power_profile: dict | None = None
         self._kill_confirm_pid: int | None = None
         self._stress_tests: dict[int, _StressInfo] = {}  # pid -> info
         self._last_processes: list = []  # cache last known process list
@@ -147,7 +144,7 @@ class GpuPowerMonitorApp(App):
                     for i in range(1, NUM_PINS + 1):
                         yield PinGauge(pin_number=i, id=f"pin-{i}")
                 yield Static("Total: -- A  -- W  |  Avg Voltage: -- V", id="summary")
-                yield Static("GPU: --", id="gpu-stats")
+                yield Static("GPU: --", id="gpu-stats", markup=True)
                 yield PlotextPlot(id="power-graph")
                 yield PlotextPlot(id="vram-graph")
                 yield PlotextPlot(id="temp-graph")
@@ -158,6 +155,8 @@ class GpuPowerMonitorApp(App):
     def on_mount(self) -> None:
         table = self.query_one("#process-table", DataTable)
         table.add_columns("PID", "Name", "VRAM (MB)", "GPU %")
+        table.border_title = "GPU Processes"
+        self.query_one("#alert-log", RichLog).border_title = "Alerts"
         self._start_reader()
 
     @work(exclusive=True, thread=True)
@@ -306,6 +305,9 @@ class GpuPowerMonitorApp(App):
 
     def _render_graph(
         self, widget_id: str, history: deque, title: str, ylabel: str,
+        ylim_max: float | None = None,
+        thresholds: list[tuple[float, str]] | None = None,
+        show_xlabel: bool = True,
     ) -> None:
         """Render a PlotextPlot with a fixed time-based X axis (seconds ago)."""
         plot_widget = self.query_one(widget_id, PlotextPlot)
@@ -317,9 +319,47 @@ class GpuPowerMonitorApp(App):
         max_seconds = GRAPH_HISTORY_LENGTH / REFRESH_RATE
         n = len(history)
         x = [-(n - 1 - i) / REFRESH_RATE for i in range(n)]
-        p.plot(x, list(history), marker="braille")
+
+        # Determine line color from thresholds
+        color = None
+        if thresholds and n > 0:
+            current = history[-1]
+            sorted_thresh = sorted(thresholds, key=lambda t: t[0])
+            if current >= sorted_thresh[-1][0]:
+                color = "red"
+            elif current >= sorted_thresh[0][0]:
+                color = "yellow"
+            else:
+                color = "green"
+
+        if color:
+            p.plot(x, list(history), marker="braille", color=color)
+        else:
+            p.plot(x, list(history), marker="braille")
+
         p.xlim(-max_seconds, 0)
-        p.xlabel("seconds ago")
+        if ylim_max is not None:
+            p.ylim(0, ylim_max)
+        p.yfrequency(5)
+
+        # Draw threshold lines
+        if thresholds:
+            for value, tcolor in thresholds:
+                p.hline(value, color=tcolor)
+
+        # Build xlabel with min/avg/max stats
+        if n >= 2:
+            min_val = min(history)
+            max_val = max(history)
+            avg_val = sum(history) / n
+            stats = f"min {min_val:.0f}  avg {avg_val:.0f}  max {max_val:.0f}"
+            if show_xlabel:
+                p.xlabel(f"{stats}  (seconds ago)")
+            else:
+                p.xlabel(stats)
+        elif show_xlabel:
+            p.xlabel("seconds ago")
+
         p.title(title)
         p.ylabel(ylabel)
         plot_widget.refresh()
@@ -351,6 +391,8 @@ class GpuPowerMonitorApp(App):
                 self.sub_title = g.name
                 if self._thermal_profile is None:
                     _, self._thermal_profile = get_gpu_profile(g.name)
+                if self._power_profile is None:
+                    self._power_profile, _ = get_gpu_profile(g.name)
             vram_pct = round(g.vram_used / g.vram_total * 100) if g.vram_total else 0
 
             # Build throttle indicator
@@ -371,10 +413,39 @@ class GpuPowerMonitorApp(App):
                             short.append(r)
                     throttle_str = f"  THROTTLE: {','.join(dict.fromkeys(short))}"
 
+            # Power color
+            pwr_pct = g.power_draw / g.power_limit if g.power_limit else 0
+            if pwr_pct >= 0.9:
+                pwr_color = "red bold"
+            elif pwr_pct >= 0.7:
+                pwr_color = "yellow"
+            else:
+                pwr_color = "green"
+
+            # Temp color
+            if self._thermal_profile:
+                if g.temperature >= self._thermal_profile.get("temp_alarm", 85):
+                    tmp_color = "red bold"
+                elif g.temperature >= self._thermal_profile.get("temp_warn", 80):
+                    tmp_color = "yellow"
+                else:
+                    tmp_color = "green"
+            else:
+                tmp_color = "green" if g.temperature < 80 else ("yellow" if g.temperature < 85 else "red bold")
+
+            # Fan color (high fan = thermal stress indicator)
+            fan_color = "green" if g.fan_speed < 70 else ("yellow" if g.fan_speed < 90 else "red")
+
+            # Throttle - make it very visible
+            if throttle_str:
+                throttle_markup = f"  [red bold reverse]{throttle_str.strip()}[/]"
+            else:
+                throttle_markup = ""
+
             gpu_text = (
-                f"Power {g.power_draw:.0f}/{g.power_limit:.0f}W  |  "
-                f"Temp {g.temperature}C  Fan {g.fan_speed}%  |  "
-                f"GPU {g.util_gpu}%  Mem {g.util_memory}%{throttle_str}\n"
+                f"Power [{pwr_color}]{g.power_draw:.0f}/{g.power_limit:.0f}W[/]  |  "
+                f"Temp [{tmp_color}]{g.temperature}C[/]  Fan [{fan_color}]{g.fan_speed}%[/]  |  "
+                f"GPU {g.util_gpu}%  Mem {g.util_memory}%{throttle_markup}\n"
                 f"Core {g.clock_graphics}MHz  Mem {g.clock_memory}MHz  |  "
                 f"VRAM {g.vram_used}/{g.vram_total}MB ({vram_pct}%)"
             )
@@ -382,21 +453,39 @@ class GpuPowerMonitorApp(App):
 
             # Feed line graphs
             self._power_history.append(g.power_draw)
-            self._vram_history.append(float(g.vram_used))
+            self._vram_history.append(g.vram_used / 1024.0)
             self._temp_history.append(float(g.temperature))
 
             self._render_graph(
                 "#power-graph", self._power_history,
                 f"Power: {g.power_draw:.0f}W", "W",
+                ylim_max=g.power_limit,
+                thresholds=[(self._power_profile["power_warn_watts"], "yellow"),
+                            (self._power_profile["power_alarm_watts"], "red")] if self._power_profile else None,
             )
+            vram_gb = g.vram_used / 1024.0
+            vram_total_gb = g.vram_total / 1024.0
             self._render_graph(
                 "#vram-graph", self._vram_history,
-                f"VRAM: {g.vram_used} / {g.vram_total} MB", "MB",
+                f"VRAM: {vram_gb:.1f}/{vram_total_gb:.0f}GB", "GB",
+                ylim_max=vram_total_gb if g.vram_total else None,
+                show_xlabel=False,
             )
             temp_title = f"Temp: {g.temperature}C"
+            temp_ylim = 100.0
+            temp_thresholds = None
             if self._thermal_profile:
-                temp_title += f" (warn {self._thermal_profile['temp_warn']}C)"
-            self._render_graph("#temp-graph", self._temp_history, temp_title, "C")
+                temp_ylim = float(self._thermal_profile["max_temp_spec"])
+                temp_thresholds = [
+                    (self._thermal_profile["temp_warn"], "yellow"),
+                    (self._thermal_profile["temp_alarm"], "red"),
+                ]
+            self._render_graph(
+                "#temp-graph", self._temp_history, temp_title, "C",
+                ylim_max=temp_ylim,
+                thresholds=temp_thresholds,
+                show_xlabel=False,
+            )
 
         # Update process table — merge nvml/nvidia-smi data with tracked stress tests
         # Cache non-empty process lists so we don't flicker when nvidia-smi is slow
@@ -433,7 +522,7 @@ class GpuPowerMonitorApp(App):
                 if proc.pid == pid:
                     vram_str = str(proc.vram_used)
                     break
-            rows.append((str(pid), name, vram_str, "--"))
+            rows.append((str(pid), name, vram_str.rjust(7), "--".rjust(5)))
         for pid in dead_pids:
             del self._stress_tests[pid]
 
@@ -442,8 +531,8 @@ class GpuPowerMonitorApp(App):
             if proc.pid in seen_pids:
                 continue
             seen_pids.add(proc.pid)
-            util_str = f"{proc.gpu_util}%" if proc.gpu_util is not None else "--"
-            rows.append((str(proc.pid), proc.name, str(proc.vram_used), util_str))
+            util_str = f"{proc.gpu_util}%".rjust(5) if proc.gpu_util is not None else "--".rjust(5)
+            rows.append((str(proc.pid), proc.name, str(proc.vram_used).rjust(7), util_str))
 
         # Rebuild table only if content changed
         new_keys = [r[0] for r in rows]
@@ -456,7 +545,7 @@ class GpuPowerMonitorApp(App):
                 for pid_str, name, vram_str, util_str in rows:
                     table.add_row(pid_str, name, vram_str, util_str, key=pid_str)
             else:
-                table.add_row("--", "No GPU processes", "--", "--")
+                table.add_row("--", "No GPU processes", "--".rjust(7), "--".rjust(5))
         else:
             # Update cell values in place (no flicker)
             for idx, (pid_str, name, vram_str, util_str) in enumerate(rows):
