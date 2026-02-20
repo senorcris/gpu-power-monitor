@@ -4,6 +4,8 @@ Per-pin power monitoring for the 12V-2x6 GPU connector on Linux. Reads voltage a
 
 Built for the ASUS ROG Astral RTX 5090 LC. The per-pin connector monitoring relies on the IT8915FN chip which is specific to certain ASUS ROG cards — other manufacturers don't expose per-pin data this way. Without the IT8915FN, the tool still works as a GPU monitor (power, temp, clocks, VRAM, processes) on any NVIDIA card via NVML.
 
+![screenshot](img/screenshot.svg)
+
 ## Why this exists
 
 The 12V-2x6 connector spec rates each power pin at 9.2A, giving a 662W electrical max across the 6 pins. The RTX 5090 draws up to 575W through that single connector, leaving about 13% margin. Connectors have melted on RTX 50-series cards even with ATX 3.1 certified PSUs and native cables. ASUS ships a Windows-only "Power Detector+" tool in GPU Tweak III that reads per-pin current from the same IT8915FN hardware — this project does the same thing on Linux, with historical graphs and cross-validation between the connector-measured power and what NVML reports the GPU is drawing.
