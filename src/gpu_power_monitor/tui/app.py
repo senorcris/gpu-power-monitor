@@ -313,10 +313,10 @@ class GpuPowerMonitorApp(App):
         p.clear_data()
         p.clear_figure()
 
-        # Build fixed X axis: -60s ... 0s, right-aligned to current data
+        # Build X axis: newest point at 0, older points negative
         max_seconds = GRAPH_HISTORY_LENGTH / REFRESH_RATE
         n = len(history)
-        x = [-(max_seconds - i / REFRESH_RATE) for i in range(n)]
+        x = [-(n - 1 - i) / REFRESH_RATE for i in range(n)]
         p.plot(x, list(history), marker="braille")
         p.xlim(-max_seconds, 0)
         p.xlabel("seconds ago")
