@@ -20,6 +20,7 @@ class GpuMonitor:
         self._initialized = False
         self._smi_cache: list[GpuProcess] = []
         self._smi_cache_time: float = 0
+        self._vram_reserved_mb: int = 0  # driver-reserved VRAM to subtract
 
     def open(self):
         """Initialize NVML and get GPU handle."""
@@ -27,6 +28,7 @@ class GpuMonitor:
             pynvml.nvmlInit()
             self._initialized = True
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+            self._vram_reserved_mb = self._query_reserved_vram()
         except pynvml.NVMLError as e:
             logger.error(f"Failed to initialize NVML: {e}")
             raise
@@ -40,6 +42,19 @@ class GpuMonitor:
                 pass
             self._initialized = False
             self._handle = None
+
+    def _query_reserved_vram(self) -> int:
+        """Query driver-reserved VRAM via nvidia-smi (MB). Returns 0 on failure."""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", f"--id={self.gpu_index}",
+                 "--query-gpu=memory.reserved", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return int(result.stdout.strip())
+        except (subprocess.TimeoutExpired, FileNotFoundError, ValueError, Exception) as e:
+            logger.debug(f"Could not query reserved VRAM: {e}")
+            return 0
 
     def __enter__(self):
         self.open()
@@ -77,9 +92,9 @@ class GpuMonitor:
             # Utilization
             util = pynvml.nvmlDeviceGetUtilizationRates(self._handle)
 
-            # VRAM
+            # VRAM — subtract driver-reserved to match nvidia-smi
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(self._handle)
-            vram_used = mem_info.used // (1024 * 1024)  # bytes -> MB
+            vram_used = max(0, mem_info.used // (1024 * 1024) - self._vram_reserved_mb)
             vram_total = mem_info.total // (1024 * 1024)
 
             # Name

@@ -84,12 +84,14 @@ class GpuPowerMonitorApp(App):
     #pin-row {
         height: auto;
         width: 100%;
+        display: none;
     }
     #summary {
         height: 1;
         width: 100%;
         text-align: center;
         text-style: bold;
+        display: none;
     }
     #gpu-stats {
         height: 2;
@@ -132,6 +134,7 @@ class GpuPowerMonitorApp(App):
         self._stress_tests: dict[int, _StressInfo] = {}  # pid -> info
         self._last_processes: list = []  # cache last known process list
         self._last_alerts: set[str] = set()  # for alert deduplication
+        self._connector_visible = False  # pin row hidden until connector data arrives
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -322,6 +325,10 @@ class GpuPowerMonitorApp(App):
 
     def _apply_snapshot_inner(self, snap: MonitorSnapshot) -> None:
         if snap.connector:
+            if not self._connector_visible:
+                self._connector_visible = True
+                self.query_one("#pin-row").styles.display = "block"
+                self.query_one("#summary").styles.display = "block"
             for pin in snap.connector.pins:
                 try:
                     gauge = self.query_one(f"#pin-{pin.pin}", PinGauge)

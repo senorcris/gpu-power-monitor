@@ -5,6 +5,12 @@ from types import SimpleNamespace
 from gpu_power_monitor.gpu import GpuMonitor
 
 
+def _open_monitor(monitor):
+    """Helper: open monitor with _query_reserved_vram mocked to 0."""
+    with patch.object(monitor, "_query_reserved_vram", return_value=0):
+        monitor.open()
+
+
 class TestGpuMonitor:
     @patch("gpu_power_monitor.gpu.pynvml")
     def test_read_stats(self, mock_pynvml):
@@ -28,7 +34,7 @@ class TestGpuMonitor:
         mock_pynvml.NVMLError = Exception
 
         monitor = GpuMonitor(gpu_index=0)
-        monitor.open()
+        _open_monitor(monitor)
 
         stats = monitor.read_stats()
         assert stats is not None
@@ -48,6 +54,34 @@ class TestGpuMonitor:
         mock_pynvml.nvmlShutdown.assert_called_once()
 
     @patch("gpu_power_monitor.gpu.pynvml")
+    def test_read_stats_subtracts_reserved_vram(self, mock_pynvml):
+        """VRAM used should subtract driver-reserved memory."""
+        mock_handle = MagicMock()
+        mock_pynvml.nvmlDeviceGetHandleByIndex.return_value = mock_handle
+        mock_pynvml.nvmlDeviceGetPowerUsage.return_value = 100000
+        mock_pynvml.nvmlDeviceGetEnforcedPowerLimit.return_value = 350000
+        mock_pynvml.nvmlDeviceGetTemperature.return_value = 50
+        mock_pynvml.nvmlDeviceGetFanSpeed.return_value = 50
+        mock_pynvml.nvmlDeviceGetClockInfo.side_effect = [1800, 1000]
+        mock_pynvml.nvmlDeviceGetUtilizationRates.return_value = SimpleNamespace(gpu=10, memory=5)
+        mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = SimpleNamespace(
+            used=600 * 1024 * 1024,   # 600 MB (includes 500 MB reserved)
+            total=32 * 1024 * 1024 * 1024,
+        )
+        mock_pynvml.nvmlDeviceGetName.return_value = "RTX 5090"
+        mock_pynvml.NVML_TEMPERATURE_GPU = 0
+        mock_pynvml.NVML_CLOCK_GRAPHICS = 0
+        mock_pynvml.NVML_CLOCK_MEM = 1
+        mock_pynvml.NVMLError = Exception
+
+        monitor = GpuMonitor()
+        with patch.object(monitor, "_query_reserved_vram", return_value=500):
+            monitor.open()
+
+        stats = monitor.read_stats()
+        assert stats.vram_used == 100  # 600 - 500 = 100 MB
+
+    @patch("gpu_power_monitor.gpu.pynvml")
     def test_read_stats_without_handle_returns_none(self, mock_pynvml):
         """read_stats returns None when handle is not set."""
         mock_pynvml.NVMLError = Exception
@@ -63,7 +97,7 @@ class TestGpuMonitor:
         mock_pynvml.nvmlDeviceGetPowerUsage.side_effect = Exception("NVML fail")
 
         monitor = GpuMonitor()
-        monitor.open()
+        _open_monitor(monitor)
         assert monitor.read_stats() is None
 
     @patch("gpu_power_monitor.gpu.pynvml")
@@ -87,7 +121,7 @@ class TestGpuMonitor:
         mock_pynvml.NVML_CLOCK_MEM = 1
 
         monitor = GpuMonitor()
-        monitor.open()
+        _open_monitor(monitor)
         stats = monitor.read_stats()
         assert stats.fan_speed == 0
 
@@ -97,9 +131,12 @@ class TestGpuMonitor:
         mock_pynvml.nvmlDeviceGetHandleByIndex.return_value = MagicMock()
         mock_pynvml.NVMLError = Exception
 
-        with GpuMonitor() as monitor:
+        monitor = GpuMonitor()
+        with patch.object(monitor, "_query_reserved_vram", return_value=0):
+            monitor.__enter__()
             mock_pynvml.nvmlInit.assert_called_once()
             assert monitor._initialized is True
+        monitor.__exit__()
 
         mock_pynvml.nvmlShutdown.assert_called_once()
 
@@ -124,7 +161,7 @@ class TestGpuMonitor:
         mock_pynvml.NVMLError = Exception
 
         monitor = GpuMonitor()
-        monitor.open()
+        _open_monitor(monitor)
         stats = monitor.read_stats()
         assert stats.name == "NVIDIA RTX 4090"
         assert isinstance(stats.name, str)
@@ -147,7 +184,7 @@ class TestGetProcesses:
         mock_pynvml.nvmlSystemGetProcessName.return_value = "/usr/bin/python3"
 
         monitor = GpuMonitor()
-        monitor.open()
+        _open_monitor(monitor)
         procs = monitor.get_processes()
 
         # Should have 2 unique PIDs, not 3
@@ -171,7 +208,7 @@ class TestGetProcesses:
         mock_pynvml.nvmlSystemGetProcessName.return_value = "/usr/bin/python3"
 
         monitor = GpuMonitor()
-        monitor.open()
+        _open_monitor(monitor)
         procs = monitor.get_processes()
 
         assert len(procs) == 1
@@ -193,7 +230,7 @@ class TestGetProcesses:
         mock_pynvml.nvmlSystemGetProcessName.return_value = "app"
 
         monitor = GpuMonitor()
-        monitor.open()
+        _open_monitor(monitor)
         result = monitor.get_processes()
 
         vrams = [p.vram_used for p in result]
@@ -220,7 +257,7 @@ class TestGetProcesses:
         mock_pynvml.nvmlSystemGetProcessName.return_value = "Xorg"
 
         monitor = GpuMonitor()
-        monitor.open()
+        _open_monitor(monitor)
         procs = monitor.get_processes()
 
         assert len(procs) == 1
@@ -265,3 +302,21 @@ class TestResolveProcessName:
         with patch("builtins.open", side_effect=FileNotFoundError):
             result = GpuMonitor._resolve_process_name(404)
         assert result == "<404>"
+
+
+class TestQueryReservedVram:
+    @patch("gpu_power_monitor.gpu.subprocess")
+    def test_parses_nvidia_smi_output(self, mock_subprocess):
+        """Should parse reserved VRAM from nvidia-smi output."""
+        mock_subprocess.run.return_value = SimpleNamespace(stdout="518\n", returncode=0)
+        mock_subprocess.TimeoutExpired = Exception
+        monitor = GpuMonitor(gpu_index=0)
+        assert monitor._query_reserved_vram() == 518
+
+    @patch("gpu_power_monitor.gpu.subprocess")
+    def test_returns_zero_on_failure(self, mock_subprocess):
+        """Should return 0 when nvidia-smi fails."""
+        mock_subprocess.run.side_effect = FileNotFoundError
+        mock_subprocess.TimeoutExpired = Exception
+        monitor = GpuMonitor()
+        assert monitor._query_reserved_vram() == 0
