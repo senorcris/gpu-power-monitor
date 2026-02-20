@@ -152,14 +152,14 @@ class StressTestModal(ModalScreen[tuple[int, str] | None]):
             select = self.query_one("#stress-preset", Select)
             preset_key = select.value if select.value != Select.BLANK else "standard"
             preset = _STRESS_PRESETS[preset_key]
-            pid = self._launch(preset["duration"], preset["matrix"], preset["dtype"])
-            self.dismiss((pid, preset_key))
+            popen = self._launch(preset["duration"], preset["matrix"], preset["dtype"])
+            self.dismiss((popen, preset_key))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
     @staticmethod
-    def _launch(duration: int, matrix_size: int, dtype: str) -> int:
+    def _launch(duration: int, matrix_size: int, dtype: str) -> subprocess.Popen:
         script = (
             f"import torch, time; "
             f"d=torch.device('cuda'); "
@@ -167,9 +167,8 @@ class StressTestModal(ModalScreen[tuple[int, str] | None]):
             f"t=time.time(); "
             f"[torch.mm(a,a) for _ in iter(lambda: time.time()-t<{duration}, False)]"
         )
-        proc = subprocess.Popen(
+        return subprocess.Popen(
             [sys.executable, "-c", script],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return proc.pid

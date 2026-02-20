@@ -49,6 +49,7 @@ class _StressInfo:
     start_time: float
     duration: int
     label: str
+    popen: object = None  # subprocess.Popen, used to reap zombies
 
 
 class GpuPowerMonitorApp(App):
@@ -412,11 +413,16 @@ class GpuPowerMonitorApp(App):
         # Tracked stress tests first (always show, never flicker)
         dead_pids = []
         for pid, info in self._stress_tests.items():
-            try:
-                os.kill(pid, 0)  # check if alive
-            except ProcessLookupError:
+            # poll() reaps zombies; returns None if still running
+            if info.popen is not None and info.popen.poll() is not None:
                 dead_pids.append(pid)
                 continue
+            elif info.popen is None:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    dead_pids.append(pid)
+                    continue
             seen_pids.add(pid)
             remaining = max(0, info.duration - (now - info.start_time))
             mins, secs = divmod(int(remaining), 60)
@@ -476,16 +482,17 @@ class GpuPowerMonitorApp(App):
         self.query_one("#alert-log", RichLog).clear()
 
     def action_stress_test(self) -> None:
-        def on_dismiss(result: tuple[int, str] | None) -> None:
+        def on_dismiss(result: tuple[object, str] | None) -> None:
             if result is not None:
-                pid, preset_key = result
+                popen, preset_key = result
                 preset = _STRESS_PRESETS[preset_key]
-                self._stress_tests[pid] = _StressInfo(
+                self._stress_tests[popen.pid] = _StressInfo(
                     start_time=time_mod.time(),
                     duration=preset["duration"],
                     label=preset["label"],
+                    popen=popen,
                 )
-                self.notify(f"Started {preset['label']} (PID {pid})")
+                self.notify(f"Started {preset['label']} (PID {popen.pid})")
         self.push_screen(StressTestModal(), callback=on_dismiss)
 
     def action_kill_process(self) -> None:
@@ -505,7 +512,12 @@ class GpuPowerMonitorApp(App):
         if self._kill_confirm_pid == pid:
             # Second press: confirmed
             try:
-                os.kill(pid, signal.SIGTERM)
+                info = self._stress_tests.get(pid)
+                if info and info.popen:
+                    info.popen.terminate()
+                    info.popen.wait(timeout=3)
+                else:
+                    os.kill(pid, signal.SIGTERM)
                 self._stress_tests.pop(pid, None)
                 self.notify(f"Sent SIGTERM to PID {pid}")
             except ProcessLookupError:
@@ -532,10 +544,14 @@ class GpuPowerMonitorApp(App):
 
     def on_unmount(self) -> None:
         """Clean up stress test subprocesses on TUI exit."""
-        for pid in list(self._stress_tests):
+        for pid, info in list(self._stress_tests.items()):
             try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
+                if info.popen is not None:
+                    info.popen.terminate()
+                    info.popen.wait(timeout=3)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
                 pass
         self._stress_tests.clear()
 
