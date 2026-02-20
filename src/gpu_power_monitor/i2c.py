@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from smbus2 import SMBus, i2c_msg
+from smbus2 import SMBus
 
 from .config import (I2C_BUS, I2C_ADDRESS, I2C_REGISTER, I2C_READ_LENGTH,
                      NUM_PINS, PIN_LABELS, VOLTAGE_MIN, VOLTAGE_MAX, CURRENT_MAX)
@@ -34,16 +34,20 @@ class IT8915Reader:
     def __exit__(self, *args): self.close()
 
     def read_raw(self) -> Optional[bytes]:
-        """Read 24 raw bytes from the IT8915FN register using i2c_rdwr.
-        Uses write-then-read transaction (write register addr, then read data).
+        """Read 24 raw bytes from the IT8915FN register.
+
+        Uses SMBus read_i2c_block_data which works correctly with the NVIDIA
+        proprietary Linux driver. Raw i2c_rdwr transactions do not properly
+        route through NVIDIA's internal I2C port handling.
+
         Returns None on error."""
         if not self._bus:
             raise RuntimeError("Bus not opened")
         try:
-            write_msg = i2c_msg.write(self.address, [self.register])
-            read_msg = i2c_msg.read(self.address, I2C_READ_LENGTH)
-            self._bus.i2c_rdwr(write_msg, read_msg)
-            return bytes(read_msg)
+            data = self._bus.read_i2c_block_data(
+                self.address, self.register, I2C_READ_LENGTH
+            )
+            return bytes(data)
         except OSError as e:
             logger.warning(f"I2C read error: {e}")
             return None

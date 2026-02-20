@@ -5,12 +5,13 @@ from gpu_power_monitor.i2c import IT8915Reader
 from gpu_power_monitor.protocol import ConnectorReading
 
 
-def build_payload(rails: list[tuple[int, int]]) -> bytes:
-    """Build a 24-byte payload from (voltage_mv, current_ma) pairs, big-endian."""
+def build_payload(rails: list[tuple[int, int]]) -> list[int]:
+    """Build a 24-byte payload from (voltage_mv, current_ma) pairs, big-endian.
+    Returns list of ints (as read_i2c_block_data returns)."""
     data = b""
     for voltage_mv, current_ma in rails:
         data += struct.pack(">HH", voltage_mv, current_ma)
-    return data
+    return list(data)
 
 
 class TestIT8915ReaderReadPins:
@@ -30,13 +31,7 @@ class TestIT8915ReaderReadPins:
 
         mock_bus = MagicMock()
         mock_smbus_cls.return_value = mock_bus
-
-        def fake_i2c_rdwr(write_msg, read_msg):
-            # Populate read_msg with our payload bytes
-            for i, b in enumerate(payload):
-                read_msg.buf[i] = b
-
-        mock_bus.i2c_rdwr.side_effect = fake_i2c_rdwr
+        mock_bus.read_i2c_block_data.return_value = payload
 
         reader = IT8915Reader(bus=1, address=0x2B)
         reader.open()
@@ -59,6 +54,9 @@ class TestIT8915ReaderReadPins:
         assert pin1.current_ma == 6000
         assert pin1.label == "Pin 1"
 
+        # Verify read_i2c_block_data was called correctly
+        mock_bus.read_i2c_block_data.assert_called_once_with(0x2B, 0x80, 24)
+
     @patch("gpu_power_monitor.i2c.SMBus")
     def test_pin_order_reversal(self, mock_smbus_cls):
         """Verify that rail index i maps to pin (6 - i)."""
@@ -67,12 +65,7 @@ class TestIT8915ReaderReadPins:
 
         mock_bus = MagicMock()
         mock_smbus_cls.return_value = mock_bus
-
-        def fake_i2c_rdwr(write_msg, read_msg):
-            for i, b in enumerate(payload):
-                read_msg.buf[i] = b
-
-        mock_bus.i2c_rdwr.side_effect = fake_i2c_rdwr
+        mock_bus.read_i2c_block_data.return_value = payload
 
         reader = IT8915Reader(bus=1, address=0x2B)
         reader.open()
@@ -95,12 +88,7 @@ class TestIT8915ReaderReadPins:
 
         mock_bus = MagicMock()
         mock_smbus_cls.return_value = mock_bus
-
-        def fake_i2c_rdwr(write_msg, read_msg):
-            for i, b in enumerate(payload):
-                read_msg.buf[i] = b
-
-        mock_bus.i2c_rdwr.side_effect = fake_i2c_rdwr
+        mock_bus.read_i2c_block_data.return_value = payload
 
         reader = IT8915Reader(bus=1, address=0x2B)
         reader.open()
@@ -115,7 +103,7 @@ class TestIT8915ReaderReadPins:
         """I2C OSError should return None from read_pins."""
         mock_bus = MagicMock()
         mock_smbus_cls.return_value = mock_bus
-        mock_bus.i2c_rdwr.side_effect = OSError("I2C error")
+        mock_bus.read_i2c_block_data.side_effect = OSError("I2C error")
 
         reader = IT8915Reader(bus=1, address=0x2B)
         reader.open()
