@@ -1,7 +1,7 @@
 import json
 import time
 from gpu_power_monitor.protocol import (
-    PinReading, ConnectorReading, GpuStats, MonitorSnapshot,
+    PinReading, ConnectorReading, GpuStats, GpuProcess, MonitorSnapshot,
 )
 
 
@@ -94,3 +94,44 @@ class TestMonitorSnapshotSerialization:
         assert snap.to_json().endswith("\n")
         # Should be parseable without the trailing newline
         json.loads(snap.to_json().strip())
+
+    def test_round_trip_with_processes(self):
+        procs = [
+            GpuProcess(pid=1234, name="python", vram_used=512, gpu_util=80),
+            GpuProcess(pid=5678, name="Xorg", vram_used=128),
+        ]
+        snap = MonitorSnapshot(
+            connector=None, gpu=None, processes=procs, timestamp=4000.0,
+        )
+        json_str = snap.to_json()
+        restored = MonitorSnapshot.from_json(json_str)
+
+        assert len(restored.processes) == 2
+        assert restored.processes[0].pid == 1234
+        assert restored.processes[0].name == "python"
+        assert restored.processes[0].vram_used == 512
+        assert restored.processes[0].gpu_util == 80
+        assert restored.processes[1].pid == 5678
+        assert restored.processes[1].gpu_util is None
+
+    def test_from_json_missing_processes_field(self):
+        """Backward compat: JSON without 'processes' key deserializes to empty list."""
+        raw = json.dumps({
+            "connector": None, "gpu": None,
+            "alerts": [], "timestamp": 5000.0,
+        })
+        restored = MonitorSnapshot.from_json(raw)
+        assert restored.processes == []
+
+
+class TestGpuProcess:
+    def test_creation_with_defaults(self):
+        p = GpuProcess(pid=42, name="test", vram_used=100)
+        assert p.pid == 42
+        assert p.name == "test"
+        assert p.vram_used == 100
+        assert p.gpu_util is None
+
+    def test_creation_with_gpu_util(self):
+        p = GpuProcess(pid=99, name="cuda_app", vram_used=2048, gpu_util=55)
+        assert p.gpu_util == 55

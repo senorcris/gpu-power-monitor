@@ -8,6 +8,7 @@ dependencies = [
     "textual>=0.89.0,<1.0",
     "smbus2>=0.4.3",
     "pynvml>=11.5.0",
+    "textual-plotext>=1.0.1",
 ]
 
 [project.scripts]

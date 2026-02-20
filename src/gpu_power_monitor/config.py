@@ -24,6 +24,9 @@ CURRENT_MAX = 15.0
 REFRESH_RATE = 2.0  # Hz
 REFRESH_INTERVAL = 1.0 / REFRESH_RATE
 
+# Graph history
+GRAPH_HISTORY_LENGTH = 120  # samples in sparkline buffer (~60s at 2Hz)
+
 # Hardware ID
 SUBSYSTEM_ID = 0x89EC1043
 

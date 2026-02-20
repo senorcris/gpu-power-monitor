@@ -39,6 +39,14 @@ class ConnectorReading:
 
 
 @dataclass
+class GpuProcess:
+    pid: int
+    name: str
+    vram_used: int  # MB
+    gpu_util: Optional[int] = None  # percent, may not be available
+
+
+@dataclass
 class GpuStats:
     power_draw: float = 0.0  # watts
     power_limit: float = 0.0  # watts
@@ -57,6 +65,7 @@ class GpuStats:
 class MonitorSnapshot:
     connector: Optional[ConnectorReading]
     gpu: Optional[GpuStats]
+    processes: list[GpuProcess] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
@@ -77,9 +86,11 @@ class MonitorSnapshot:
         gpu = None
         if d.get("gpu") is not None:
             gpu = GpuStats(**d["gpu"])
+        processes = [GpuProcess(**p) for p in d.get("processes", [])]
         return cls(
             connector=connector,
             gpu=gpu,
+            processes=processes,
             alerts=d.get("alerts", []),
             timestamp=d["timestamp"],
         )

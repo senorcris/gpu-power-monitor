@@ -44,7 +44,13 @@ def _read_snapshot(reader: IT8915Reader, gpu_mon: GpuMonitor) -> MonitorSnapshot
         logger.warning(f"GPU read failed: {e}")
         gpu = None
 
-    snap = MonitorSnapshot(connector=connector, gpu=gpu)
+    try:
+        processes = gpu_mon.get_processes()
+    except Exception as e:
+        logger.warning(f"Process list failed: {e}")
+        processes = []
+
+    snap = MonitorSnapshot(connector=connector, gpu=gpu, processes=processes)
     snap.alerts = _build_alerts(snap)
     return snap
 
