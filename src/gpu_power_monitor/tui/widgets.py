@@ -6,9 +6,10 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Label, Select, Static, ProgressBar
+from textual.widgets import Button, Input, Label, Select, Static, ProgressBar
 
 from ..config import CURRENT_ALERT_THRESHOLD, CURRENT_WARN_THRESHOLD
+from ..gpu import PowerLimitConstraints
 from ..protocol import PinReading
 
 
@@ -172,3 +173,122 @@ class StressTestModal(ModalScreen[tuple[int, str] | None]):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+class PowerLimitModal(ModalScreen[float | None]):
+    """Modal dialog for setting GPU power limit.
+
+    Dismisses with the target wattage, or None on cancel.
+    """
+
+    DEFAULT_CSS = """
+    PowerLimitModal {
+        align: center middle;
+    }
+    #pl-dialog {
+        width: 56;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #pl-dialog .pl-heading {
+        text-style: bold;
+        text-align: center;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    #pl-dialog .pl-info {
+        text-align: center;
+        width: 100%;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #pl-dialog Input {
+        width: 100%;
+        margin-bottom: 1;
+    }
+    #pl-presets {
+        height: auto;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    #pl-presets Button {
+        width: 1fr;
+        margin: 0 1;
+    }
+    #pl-buttons {
+        height: auto;
+        width: 100%;
+        margin-top: 1;
+    }
+    #pl-buttons Button {
+        width: 1fr;
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(
+        self,
+        constraints: PowerLimitConstraints,
+        current_limit: float,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._constraints = constraints
+        self._current_limit = current_limit
+
+    def compose(self) -> ComposeResult:
+        c = self._constraints
+        with Vertical(id="pl-dialog"):
+            yield Label("Set Power Limit", classes="pl-heading")
+            yield Label(
+                f"Current: {self._current_limit:.0f}W  |  "
+                f"Default: {c.default_watts:.0f}W\n"
+                f"Range: {c.min_watts:.0f}W – {c.max_watts:.0f}W\n"
+                f"Requires root / sudo",
+                classes="pl-info",
+            )
+            yield Input(
+                value=str(int(self._current_limit)),
+                placeholder=f"{c.min_watts:.0f}–{c.max_watts:.0f}",
+                type="integer",
+                id="pl-input",
+            )
+            with Horizontal(id="pl-presets"):
+                yield Button(f"Default ({c.default_watts:.0f}W)", id="pl-preset-100")
+                yield Button(f"80% ({c.default_watts * 0.8:.0f}W)", id="pl-preset-80")
+                yield Button(f"70% ({c.default_watts * 0.7:.0f}W)", id="pl-preset-70")
+                yield Button(f"60% ({c.default_watts * 0.6:.0f}W)", id="pl-preset-60")
+            with Horizontal(id="pl-buttons"):
+                yield Button("Apply", variant="success", id="pl-apply")
+                yield Button("Cancel", variant="error", id="pl-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "pl-cancel":
+            self.dismiss(None)
+            return
+
+        c = self._constraints
+        if bid and bid.startswith("pl-preset-"):
+            pct = int(bid.split("-")[-1])
+            watts = c.default_watts * (pct / 100)
+            self.query_one("#pl-input", Input).value = str(int(watts))
+            return
+
+        if bid == "pl-apply":
+            try:
+                watts = float(self.query_one("#pl-input", Input).value)
+            except ValueError:
+                self.notify("Enter a valid number", severity="error")
+                return
+            watts = max(c.min_watts, min(c.max_watts, watts))
+            self.dismiss(watts)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

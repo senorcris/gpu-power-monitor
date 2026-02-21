@@ -19,7 +19,7 @@ from ..config import (
     REFRESH_INTERVAL, REFRESH_RATE, NUM_PINS, get_socket_path, get_gpu_profile,
 )
 from ..protocol import MonitorSnapshot
-from .widgets import PinGauge, StressTestModal, _STRESS_PRESETS
+from .widgets import PinGauge, PowerLimitModal, StressTestModal, _STRESS_PRESETS
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ class GpuPowerMonitorApp(App):
         Binding("q", "quit", "Quit"),
         Binding("r", "clear_log", "Clear Log"),
         Binding("s", "stress_test", "Stress Test"),
+        Binding("p", "power_limit", "Power Limit"),
         Binding("k", "kill_process", "Kill Process"),
     ]
 
@@ -133,6 +134,7 @@ class GpuPowerMonitorApp(App):
         self._last_processes: list = []  # cache last known process list
         self._last_alerts: set[str] = set()  # for alert deduplication
         self._connector_visible = False  # pin row hidden until connector data arrives
+        self._gpu_monitor = None  # GpuMonitor reference for power limit control
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -215,6 +217,7 @@ class GpuPowerMonitorApp(App):
             gpu_mon.open()
         except Exception as e:
             logger.warning(f"Could not open GPU monitor: {e}")
+        self._gpu_monitor = gpu_mon
 
         try:
             while True:
@@ -583,6 +586,36 @@ class GpuPowerMonitorApp(App):
                 )
                 self.notify(f"Started {preset['label']} (PID {popen.pid})")
         self.push_screen(StressTestModal(), callback=on_dismiss)
+
+    def action_power_limit(self) -> None:
+        """Open the power limit configuration modal."""
+        if not self._gpu_monitor:
+            self.notify("GPU monitor not available", severity="error")
+            return
+        constraints = self._gpu_monitor.get_power_limit_constraints()
+        if not constraints:
+            self.notify("Could not query power limit constraints", severity="error")
+            return
+        # Get current enforced limit
+        stats = self._gpu_monitor.read_stats()
+        current_limit = stats.power_limit if stats else constraints.default_watts
+
+        def on_dismiss(watts: float | None) -> None:
+            if watts is not None:
+                success, msg = self._gpu_monitor.set_power_limit(watts)
+                if success:
+                    self.notify(msg)
+                    log = self.query_one("#alert-log", RichLog)
+                    log.write(f"[green]{msg}[/green]")
+                else:
+                    self.notify(msg, severity="error")
+                    log = self.query_one("#alert-log", RichLog)
+                    log.write(f"[red]Power limit error: {msg}[/red]")
+
+        self.push_screen(
+            PowerLimitModal(constraints, current_limit),
+            callback=on_dismiss,
+        )
 
     def action_kill_process(self) -> None:
         """Kill the selected GPU process (with confirmation)."""

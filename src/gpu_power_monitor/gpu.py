@@ -1,10 +1,19 @@
 import logging
 import subprocess
+from dataclasses import dataclass
 from typing import Optional
 
 import pynvml
 
 from .protocol import GpuStats, GpuProcess
+
+
+@dataclass
+class PowerLimitConstraints:
+    """Min/max/default power limits for a GPU, in watts."""
+    min_watts: float
+    max_watts: float
+    default_watts: float
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +134,47 @@ class GpuMonitor:
         except pynvml.NVMLError as e:
             logger.warning(f"Error reading GPU stats: {e}")
             return None
+
+    def get_power_limit_constraints(self) -> Optional[PowerLimitConstraints]:
+        """Get min/max/default power limits for the GPU."""
+        if not self._handle:
+            return None
+        try:
+            min_mw, max_mw = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(self._handle)
+            default_mw = pynvml.nvmlDeviceGetPowerManagementDefaultLimit(self._handle)
+            return PowerLimitConstraints(
+                min_watts=min_mw / 1000.0,
+                max_watts=max_mw / 1000.0,
+                default_watts=default_mw / 1000.0,
+            )
+        except pynvml.NVMLError as e:
+            logger.warning(f"Could not get power limit constraints: {e}")
+            return None
+
+    def set_power_limit(self, watts: float) -> tuple[bool, str]:
+        """Set the GPU power limit in watts. Returns (success, message)."""
+        if not self._handle:
+            return False, "GPU not initialized"
+        mw = int(watts * 1000)
+        # Try NVML first (requires root)
+        try:
+            pynvml.nvmlDeviceSetPowerManagementLimit(self._handle, mw)
+            return True, f"Power limit set to {watts:.0f}W"
+        except pynvml.NVMLError:
+            pass
+        # Fallback to nvidia-smi
+        try:
+            result = subprocess.run(
+                ["sudo", "nvidia-smi", f"-i", str(self.gpu_index), "-pl", str(int(watts))],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return True, f"Power limit set to {watts:.0f}W (via nvidia-smi)"
+            return False, f"nvidia-smi failed: {result.stderr.strip()}"
+        except subprocess.TimeoutExpired:
+            return False, "nvidia-smi timed out"
+        except FileNotFoundError:
+            return False, "nvidia-smi not found"
 
     def get_processes(self) -> list[GpuProcess]:
         """Get list of processes using the GPU, merging compute and graphics."""
