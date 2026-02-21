@@ -3,6 +3,7 @@ name = "gpu-power-monitor"
 version = "0.1.0"
 description = "Linux power monitoring for ASUS ROG RTX 5090 Astral LC 12V-2x6 connector via IT8915FN I2C"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
     "textual>=0.89.0,<1.0",
