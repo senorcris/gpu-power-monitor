@@ -17,6 +17,49 @@ from ..gpu import PowerLimitConstraints
 from ..protocol import PinReading
 
 
+class MetricPanel(Static):
+    """Three-line instrument readout, matching the thermal panel."""
+
+    DEFAULT_CSS = """
+    MetricPanel {
+        height: 5;
+        padding: 0 1;
+        border: round #728399;
+        background: $surface;
+    }
+    """
+
+    def __init__(self, title: str, **kwargs):
+        super().__init__(**kwargs)
+        self.border_title = title
+
+    def on_mount(self) -> None:
+        self.clear_reading()
+
+    def clear_reading(self, message: str = "Waiting for readings") -> None:
+        self.styles.border = ("round", "#728399")
+        self.tooltip = None
+        self.update(Text(f"—\n{message}", style="dim"))
+
+    def update_reading(
+        self, value: str, label: str, detail: str, fraction: float | None,
+        color: str = "#78c9ed", secondary: str = "",
+    ) -> None:
+        self.styles.border = ("round", color)
+        text = Text()
+        text.append(value, style=f"bold {color}")
+        text.append(f"  · {label}\n", style=color)
+        if fraction is not None:
+            filled = round(max(0, min(1, fraction)) * 16)
+            text.append("━" * filled, style=f"bold {color}")
+            text.append("━" * (16 - filled), style="dim")
+        else:
+            text.append(secondary or "Meter unavailable", style=color)
+        text.append(f"\n{detail}", style="dim")
+        self.tooltip = f"{self.border_title}: {value}. {label}. {detail}"
+        self.update(text)
+
+
 class TemperaturePanel(Static):
     """A compact thermal readout with redundant color and status cues."""
 
@@ -131,14 +174,14 @@ class PinGauge(Widget):
     PinGauge {
         width: 1fr;
         height: auto;
-        border: solid green;
+        border: round #5ed6a0;
         padding: 0 1;
     }
     PinGauge.warn {
-        border: solid yellow;
+        border: round #f5c26b;
     }
     PinGauge.alert {
-        border: solid red;
+        border: round #ff7b86;
     }
     PinGauge .pin-label {
         text-style: bold;

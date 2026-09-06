@@ -24,7 +24,7 @@ from ..config import (
     REFRESH_INTERVAL, REFRESH_RATE, NUM_PINS, get_socket_path, get_gpu_profile,
 )
 from ..protocol import MonitorSnapshot
-from .widgets import PinGauge, PowerLimitModal, StressTestModal, DetailsModal, TemperaturePanel, _STRESS_PRESETS
+from .widgets import PinGauge, PowerLimitModal, StressTestModal, DetailsModal, TemperaturePanel, MetricPanel, _STRESS_PRESETS
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,9 @@ class GpuPowerMonitorApp(App):
     #pin-row { height: auto; width: 100%; display: none;
         grid-size: 6; grid-columns: 1fr; grid-rows: 7; }
     #summary { height: auto; padding: 0 1; color: $text-muted; }
-    #gpu-stats { height: auto; min-height: 2; padding: 0 1; }
+    #gpu-stats { height: auto; padding: 0 1; color: $text-muted; }
+    #metric-grid { height: auto; grid-size: 3; grid-columns: 1fr;
+        grid-rows: 5; grid-gutter: 0 1; }
     #recovery { height: auto; max-height: 2; color: $warning; display: none; }
     #graph-hint, #latest-event, .page-hint { height: 1; color: $text-muted; }
     #power-graph, #vram-graph, #temp-graph { height: 8; }
@@ -163,7 +165,13 @@ class GpuPowerMonitorApp(App):
                             yield PinGauge(pin_number=i, id=f"pin-{i}")
                     yield Static("Connector: waiting for readings", id="summary", markup=False)
                     yield Static("GPU: waiting for readings", id="gpu-stats", markup=False)
-                    yield TemperaturePanel(id="temperature")
+                    with Grid(id="metric-grid"):
+                        yield TemperaturePanel(id="temperature")
+                        yield MetricPanel("GPU power", id="metric-power")
+                        yield MetricPanel("Fan speed", id="metric-fan")
+                        yield MetricPanel("GPU activity", id="metric-activity")
+                        yield MetricPanel("VRAM", id="metric-vram")
+                        yield MetricPanel("Clock speeds", id="metric-clocks")
                     yield Static("g: switch graph · a: active conditions and connection details", id="graph-hint", markup=False)
                     yield PlotextPlot(id="power-graph")
                     yield PlotextPlot(id="vram-graph")
@@ -224,6 +232,10 @@ class GpuPowerMonitorApp(App):
         columns = 6 if width >= 108 else 3 if width >= 60 else 2 if width >= 32 else 1
         pin_grid.styles.grid_size_columns = columns
         pin_grid.styles.grid_size_rows = (NUM_PINS + columns - 1) // columns
+        metric_columns = 3 if width >= 92 else 2 if width >= 61 else 1
+        metric_grid = self._ui("#metric-grid")
+        metric_grid.styles.grid_size_columns = metric_columns
+        metric_grid.styles.grid_size_rows = 6 // metric_columns
         gpu = bool(snap and snap.gpu and not self._stale)
         for name in ("power", "vram", "temp"):
             widget = self._ui(f"#{name}-graph")
@@ -280,6 +292,7 @@ class GpuPowerMonitorApp(App):
             self._ui("#summary", Static).update("Connector readings stale — waiting for fresh data")
             self._ui("#gpu-stats", Static).update("GPU readings stale — waiting for fresh data")
             self._ui("#temperature", TemperaturePanel).clear_reading("Stale · waiting for fresh data")
+            self._clear_metrics("Stale · awaiting readings")
             self._layout()
         self._update_status()
 
@@ -493,6 +506,40 @@ class GpuPowerMonitorApp(App):
         p.ylabel(ylabel)
         plot_widget.refresh()
 
+    def _clear_metrics(self, message: str) -> None:
+        for panel in self.screen_stack[0].query(MetricPanel):
+            panel.clear_reading(message)
+
+    def _update_metrics(self, g) -> None:
+        profile = self._power_profile or get_gpu_profile(g.name)[0]
+        color, status = ("#ff7b86", "Alert") if g.power_draw >= profile["power_alarm_watts"] else (
+            ("#f5c26b", "Warning") if g.power_draw >= profile["power_warn_watts"] else
+            ("#5ed6a0", "Normal")
+        )
+        self._ui("#metric-power", MetricPanel).update_reading(
+            f"{g.power_draw:.0f} W", status,
+            f"Limit {g.power_limit:.0f} W" if g.power_limit > 0 else "Power limit unavailable",
+            g.power_draw / g.power_limit if g.power_limit > 0 else None, color,
+        )
+        self._ui("#metric-fan", MetricPanel).update_reading(
+            f"{g.fan_speed}%", "Spinning" if g.fan_speed else "Stopped",
+            "Reported fan speed", g.fan_speed / 100, "#78c9ed",
+        )
+        self._ui("#metric-activity", MetricPanel).update_reading(
+            f"{g.util_gpu}%", "Active" if g.util_gpu else "Idle",
+            f"Memory activity {g.util_memory}%", g.util_gpu / 100, "#78c9ed",
+        )
+        total, used = g.vram_total / 1024, g.vram_used / 1024
+        self._ui("#metric-vram", MetricPanel).update_reading(
+            f"{used:.1f} GiB", "Used",
+            f"{max(0, total - used):.1f} free / {total:.1f} GiB" if total > 0 else "VRAM capacity unavailable",
+            used / total if total > 0 else None, "#b7a3ee",
+        )
+        self._ui("#metric-clocks", MetricPanel).update_reading(
+            f"{g.clock_graphics:,} MHz", "Core", "Current clock speeds", None,
+            "#b7a3ee", secondary=f"{g.clock_memory:,} MHz memory",
+        )
+
     def _apply_snapshot_inner(self, snap: MonitorSnapshot) -> None:
         self._last_snapshot = snap
         self._stale = False
@@ -552,13 +599,10 @@ class GpuPowerMonitorApp(App):
                             short.append(r)
                     throttle_str = f"  THROTTLE: {','.join(dict.fromkeys(short))}"
 
-            gpu_text = (
-                f"GPU {g.util_gpu}%   Power {g.power_draw:.0f} / {g.power_limit:.0f} W   "
-                f"VRAM {g.vram_used/1024:.1f} / {g.vram_total/1024:.1f} GiB\n"
-                f"Fan {g.fan_speed}%   Core {g.clock_graphics} MHz   Memory {g.clock_memory} MHz"
-                f"{throttle_str}"
+            self._ui("#gpu-stats", Static).update(
+                Text(throttle_str.strip(), style="bold #f5c26b") if throttle_str else ""
             )
-            self._ui("#gpu-stats", Static).update(gpu_text)
+            self._update_metrics(g)
             self._ui("#temperature", TemperaturePanel).update_reading(
                 g.temperature, self._thermal_profile or get_gpu_profile(g.name)[1],
             )
@@ -602,6 +646,7 @@ class GpuPowerMonitorApp(App):
         else:
             self._ui("#gpu-stats", Static).update("GPU readings unavailable")
             self._ui("#temperature", TemperaturePanel).clear_reading("GPU readings unavailable")
+            self._clear_metrics("GPU readings unavailable")
             # Discard history across a gap so old samples aren't shown as current.
             self._power_history.clear()
             self._vram_history.clear()

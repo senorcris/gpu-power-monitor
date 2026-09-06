@@ -10,7 +10,9 @@ GPU Power Monitor is a Linux terminal dashboard for NVIDIA GPUs. On supported AS
 
 If your card does not expose per-pin data, the NVML dashboard still works.
 
-![GPU Power Monitor terminal dashboard showing six connector pin gauges and GPU history graphs](img/screenshot.svg)
+![GPU Power Monitor with a process sidebar, six connector pin gauges, colored temperature, power, fan, activity, VRAM and clock panels, and live history graphs](img/screenshot.svg)
+
+Live dashboard on an RTX 5090. Metric panels and pin gauges reflow in narrower terminals.
 
 ## Why per-pin readings are useful
 
@@ -121,6 +123,12 @@ changing severity, and resolving; clearing history does not clear active warning
 The source line shows when each sensor last returned a reading. Missing readings
 are retried automatically. Press `a` for the current conditions, failure details,
 thresholds, and connection guidance.
+
+Temperature, GPU power, fan speed, GPU activity, VRAM, and clock speeds have
+compact readout panels that reflow into three, two, or one column. Temperature
+and power use the GPU profile's warning and alert colors; fan/activity meters
+are blue, and memory/clocks are lavender. Power shows the current limit, VRAM
+shows free capacity, and stale or unavailable readings switch to neutral panels.
 
 ### Keyboard controls
 
