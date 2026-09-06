@@ -7,7 +7,7 @@ from typing import Optional
 from .config import (
     I2C_BUS, I2C_ADDRESS, I2C_REGISTER,
     REFRESH_INTERVAL, CURRENT_WARN_THRESHOLD, CURRENT_ALERT_THRESHOLD,
-    VOLTAGE_MIN, VOLTAGE_MAX, TEMP_WARN_THRESHOLD, TEMP_ALERT_THRESHOLD,
+    VOLTAGE_MIN, VOLTAGE_MAX,
     get_socket_path, get_gpu_profile,
 )
 from .i2c import IT8915Reader
@@ -15,6 +15,20 @@ from .gpu import GpuMonitor
 from .protocol import MonitorSnapshot
 
 logger = logging.getLogger(__name__)
+
+
+async def _broadcast(clients: set[asyncio.StreamWriter], data: bytes):
+    """Send to the current clients, dropping broken or stalled connections."""
+    async def send(writer):
+        try:
+            writer.write(data)
+            await asyncio.wait_for(writer.drain(), timeout=REFRESH_INTERVAL)
+        except (OSError, asyncio.TimeoutError):
+            clients.discard(writer)
+            # Abort discards buffered data rather than waiting on a stalled peer.
+            writer.transport.abort()
+
+    await asyncio.gather(*(send(writer) for writer in tuple(clients)))
 
 
 def _build_alerts(snapshot: MonitorSnapshot) -> list[str]:
@@ -33,15 +47,17 @@ def _build_alerts(snapshot: MonitorSnapshot) -> list[str]:
             elif volts > VOLTAGE_MAX:
                 alerts.append(f"ALERT: {pin.label} voltage {volts:.2f}V above {VOLTAGE_MAX}V maximum")
     if snapshot.gpu is not None:
+        power_profile, thermal_profile = get_gpu_profile(snapshot.gpu.name)
+        temp_warn = thermal_profile["temp_warn"]
+        temp_alarm = thermal_profile["temp_alarm"]
         temp = snapshot.gpu.temperature
-        if temp >= TEMP_ALERT_THRESHOLD:
-            alerts.append(f"ALERT: GPU temperature {temp}C exceeds {TEMP_ALERT_THRESHOLD}C limit")
-        elif temp >= TEMP_WARN_THRESHOLD:
-            alerts.append(f"WARN: GPU temperature {temp}C exceeds {TEMP_WARN_THRESHOLD}C warning")
+        if temp >= temp_alarm:
+            alerts.append(f"ALERT: GPU temperature {temp}C exceeds {temp_alarm}C limit")
+        elif temp >= temp_warn:
+            alerts.append(f"WARN: GPU temperature {temp}C exceeds {temp_warn}C warning")
 
         # Model-specific power thresholds
         if snapshot.gpu.name:
-            power_profile, _ = get_gpu_profile(snapshot.gpu.name)
             pw = snapshot.gpu.power_draw
             if pw >= power_profile["power_alarm_watts"]:
                 alerts.append(
@@ -69,25 +85,40 @@ def _build_alerts(snapshot: MonitorSnapshot) -> list[str]:
 
 def _read_snapshot(reader: IT8915Reader, gpu_mon: GpuMonitor) -> MonitorSnapshot:
     """Take one reading from I2C and GPU, return a MonitorSnapshot."""
+    errors = {}
     try:
+        if reader._bus is None:
+            reader.open()
         connector = reader.read_pins()
+        if connector is None:
+            reason = getattr(reader, "last_error", None)
+            errors["connector"] = reason if isinstance(reason, str) else "No I2C reading; check the bus and permissions."
     except Exception as e:
         logger.warning(f"I2C read failed: {e}")
         connector = None
+        errors["connector"] = str(e)
 
     try:
+        if gpu_mon._handle is None:
+            gpu_mon.close()
+            gpu_mon.open()
         gpu = gpu_mon.read_stats()
+        if gpu is None:
+            reason = getattr(gpu_mon, "last_error", None)
+            errors["gpu"] = reason if isinstance(reason, str) else "No NVML reading; check the NVIDIA driver."
     except Exception as e:
         logger.warning(f"GPU read failed: {e}")
         gpu = None
+        errors["gpu"] = str(e)
 
     try:
         processes = gpu_mon.get_processes()
     except Exception as e:
         logger.warning(f"Process list failed: {e}")
         processes = []
+        errors["processes"] = str(e)
 
-    snap = MonitorSnapshot(connector=connector, gpu=gpu, processes=processes)
+    snap = MonitorSnapshot(connector=connector, gpu=gpu, processes=processes, errors=errors)
     snap.alerts = _build_alerts(snap)
     return snap
 
@@ -144,26 +175,11 @@ async def _daemon_main(bus=None, address=None, register=None):
     clients: set[asyncio.StreamWriter] = set()
     socket_path = get_socket_path()
 
-    async def _broadcast(data: bytes):
-        dead = set()
-        for writer in clients:
-            try:
-                writer.write(data)
-                await writer.drain()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                dead.add(writer)
-        for writer in dead:
-            clients.discard(writer)
-            try:
-                writer.close()
-            except Exception:
-                pass
-
     async def _poll_loop():
         while not stop_event.is_set():
             snap = await loop.run_in_executor(None, _read_snapshot, reader, gpu_mon)
             data = snap.to_json().encode()
-            await _broadcast(data)
+            await _broadcast(clients, data)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=REFRESH_INTERVAL)
             except asyncio.TimeoutError:

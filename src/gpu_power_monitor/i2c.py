@@ -21,9 +21,15 @@ class IT8915Reader:
         self.address = address
         self.register = register
         self._bus: Optional[SMBus] = None
+        self.last_error: Optional[str] = None
 
     def open(self):
-        self._bus = SMBus(self.bus_num)
+        try:
+            self._bus = SMBus(self.bus_num)
+            self.last_error = None
+        except OSError as e:
+            self.last_error = str(e)
+            raise
 
     def close(self):
         if self._bus:
@@ -47,8 +53,10 @@ class IT8915Reader:
             data = self._bus.read_i2c_block_data(
                 self.address, self.register, I2C_READ_LENGTH
             )
+            self.last_error = None
             return bytes(data)
         except OSError as e:
+            self.last_error = str(e)
             logger.warning(f"I2C read error: {e}")
             return None
 

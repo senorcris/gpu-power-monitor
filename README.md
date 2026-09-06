@@ -108,15 +108,51 @@ uv run gpu-power-monitor --help
 
 The daemon listens on `/run/user/$UID/gpu-power-monitor.sock`. The dashboard connects to it when available. Otherwise, it reads the hardware directly.
 
+The Monitor tab shows all six pin gauges and the power, VRAM, and temperature
+history graphs. At 140 columns or wider, the process list stays on the left;
+in narrower windows, use the Processes tab (`x`). Gauges adapt to the remaining
+monitor width. All three history graphs remain available at every terminal size.
+Pin gauges reflow into six, three, two,
+or one column as the terminal narrows. Scroll in shorter windows, or press `g`
+to jump to the next graph. The health
+summary stays visible on every tab. Event history records conditions starting,
+changing severity, and resolving; clearing history does not clear active warnings.
+
+The source line shows when each sensor last returned a reading. Missing readings
+are retried automatically. Press `a` for the current conditions, failure details,
+thresholds, and connection guidance.
+
 ### Keyboard controls
 
 | Key | Action |
 | --- | --- |
 | `q` | Quit |
-| `r` | Clear the alert log |
-| `s` | Start a stress test. This requires CUDA-enabled PyTorch |
+| `m` | Show Monitor |
+| `x` | Show Processes |
+| `e` | Show Event History |
+| `g` | Jump to the next power, VRAM, or temperature graph |
+| `a` | Show active conditions, thresholds, and connection details |
+| `r` | Clear event history; active warnings remain visible |
+| `s` | Open stress-test presets and check PyTorch/CUDA readiness |
 | `p` | Change the GPU power limit. This requires NVIDIA permissions |
-| `k` | Stop the selected process. Press twice to confirm |
+| `k` | In Processes, terminate the named process with SIGTERM. Press twice to confirm |
+
+### Stress tests
+
+Stress tests are optional and require CUDA-enabled PyTorch in the same Python
+environment as GPU Power Monitor. Start stays disabled if PyTorch or CUDA is
+unavailable. A readiness check runs when the dialog opens; it does not start a workload.
+
+For a project checkout, run `uv run --with torch gpu-power-monitor`.
+For a `uv tool` installation from a checkout, use:
+
+```bash
+uv tool install --force --with torch .
+```
+
+Run that command from this repository. Choose a PyTorch build compatible with your
+NVIDIA driver. Tests report Starting, Running, Completed, Stopped, or Failed, and
+failure details remain in Event History. Quit also stops tests launched by this app.
 
 ## How it works
 

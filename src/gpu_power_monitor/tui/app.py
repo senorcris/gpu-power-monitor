@@ -1,15 +1,20 @@
 import logging
 import os
 import signal
+import re
+import queue
+import subprocess
+import threading
 import time as time_mod
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from rich.text import Text
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Grid, VerticalScroll
 from textual.widgets import (
-    DataTable, Footer, Header, RichLog, Static,
+    DataTable, Footer, Header, RichLog, Static, TabbedContent, TabPane,
 )
 from textual import work
 from textual_plotext import PlotextPlot
@@ -19,7 +24,7 @@ from ..config import (
     REFRESH_INTERVAL, REFRESH_RATE, NUM_PINS, get_socket_path, get_gpu_profile,
 )
 from ..protocol import MonitorSnapshot
-from .widgets import PinGauge, PowerLimitModal, StressTestModal, _STRESS_PRESETS
+from .widgets import PinGauge, PowerLimitModal, StressTestModal, DetailsModal, TemperaturePanel, _STRESS_PRESETS
 
 logger = logging.getLogger(__name__)
 
@@ -50,73 +55,72 @@ class _StressInfo:
     duration: int
     label: str
     popen: object = None  # subprocess.Popen, used to reap zombies
+    state: str = "Running"
+    output: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
+    tail: deque = field(default_factory=lambda: deque(maxlen=8))
+    output_done: threading.Event | None = None
+    stopping: bool = False
+
+
+def _alert_key(message: str) -> str:
+    """Stable condition identity, independent of measured values and severity."""
+    match = re.search(r"Pin \d+ (?:current|voltage)|GPU (?:temperature|power)|Connector power", message)
+    return match.group() if match else message.split(": ", 1)[-1]
+
+
+class ProcessPane(TabPane):
+    """A docked process list must not activate its hidden tab on focus."""
+
+    def on_tab_pane_focused(self, event: TabPane.Focused) -> None:
+        if self.styles.dock == "left":
+            event.stop()
 
 
 class GpuPowerMonitorApp(App):
     """TUI for monitoring GPU 12V-2x6 connector power delivery."""
 
-    TITLE = "GPU Power Monitor - 12V-2x6 Connector"
+    TITLE = "GPU Power Monitor"
+
+    def get_driver_class(self):
+        driver_class = super().get_driver_class()
+        if os.name == "posix":
+            from textual.drivers.linux_driver import LinuxDriver
+            from .driver import CleanExitLinuxDriver
+
+            if driver_class is LinuxDriver:
+                return CleanExitLinuxDriver
+        return driver_class
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("r", "clear_log", "Clear Log"),
-        Binding("s", "stress_test", "Stress Test"),
-        Binding("p", "power_limit", "Power Limit"),
-        Binding("k", "kill_process", "Kill Process"),
+        Binding("m", "show_monitor", "Monitor", show=False),
+        Binding("x", "show_processes", "Processes"),
+        Binding("e", "show_events", "History", show=False),
+        Binding("g", "cycle_graph", "Graph"),
+        Binding("a", "conditions", "Alerts"),
+        Binding("r", "clear_log", "Clear history", show=False),
+        Binding("s", "stress_test", "Stress"),
+        Binding("p", "power_limit", "Power"),
+        Binding("k", "kill_process", "Terminate", show=False),
     ]
 
     DEFAULT_CSS = """
-    Screen {
-        layout: vertical;
-    }
-    #main-layout {
-        height: 1fr;
-    }
-    #left-panel {
-        width: 1fr;
-        min-width: 36;
-        margin-right: 1;
-    }
-    #right-panel {
-        width: 2fr;
-    }
-    #process-table {
-        height: 1fr;
-        border: round $accent;
-    }
-    #pin-row {
-        height: auto;
-        width: 100%;
-        display: none;
-    }
-    #summary {
-        height: 1;
-        width: 100%;
-        text-align: center;
-        text-style: bold;
-        display: none;
-    }
-    #gpu-stats {
-        height: 2;
-        width: 100%;
-        text-align: center;
-        padding: 0 1;
-    }
-    #power-graph, #vram-graph, #temp-graph {
-        height: 8;
-        min-width: 40;
-    }
-    #alert-log {
-        height: 1fr;
-        border: round $accent;
-    }
-    #kill-confirm {
-        height: 1;
-        background: $warning;
-        color: $text;
-        text-align: center;
-        display: none;
-    }
+    Screen { layout: vertical; }
+    #health-status { height: 2; padding: 0 1; background: $surface; text-style: bold; }
+    #source-status { height: 1; padding: 0 1; color: $text-muted; }
+    #stress-status { height: 1; padding: 0 1; display: none; }
+    #views { height: 1fr; }
+    TabPane { padding: 0; height: 1fr; }
+    #monitor-scroll { height: 1fr; }
+    #pin-row { height: auto; width: 100%; display: none;
+        grid-size: 6; grid-columns: 1fr; grid-rows: 7; }
+    #summary { height: auto; padding: 0 1; color: $text-muted; }
+    #gpu-stats { height: auto; min-height: 2; padding: 0 1; }
+    #recovery { height: auto; max-height: 2; color: $warning; display: none; }
+    #graph-hint, #latest-event, .page-hint { height: 1; color: $text-muted; }
+    #power-graph, #vram-graph, #temp-graph { height: 8; }
+    #alert-log, #process-table { height: 1fr; border: round $accent; }
+    #kill-confirm { height: 2; background: $warning; color: $text; display: none; }
     """
 
     def __init__(self, bus=None, address=None, register=None, **kwargs):
@@ -131,52 +135,241 @@ class GpuPowerMonitorApp(App):
         self._power_profile: dict | None = None
         self._kill_confirm_pid: int | None = None
         self._stress_tests: dict[int, _StressInfo] = {}  # pid -> info
-        self._last_processes: list = []  # cache last known process list
-        self._last_alerts: set[str] = set()  # for alert deduplication
+        self._last_processes: list = []  # latest snapshot's process list
+        self._last_alerts: dict[str, str] = {}
         self._connector_visible = False  # pin row hidden until connector data arrives
         self._gpu_monitor = None  # GpuMonitor reference for power limit control
+        self._control_monitor = None  # UI-owned NVML connection when using the daemon
+        self._last_snapshot: MonitorSnapshot | None = None
+        self._last_good: dict[str, float] = {}
+        self._graph_index = 0
+        self._latest_event = "No events yet. Active conditions remain above; e opens history."
+        self._stale = False
+        self._kill_confirm_name = ""
+        self._source_text = "Source: connecting | No samples yet"
+        self._wide_processes = False
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Horizontal(id="main-layout"):
-            with Vertical(id="left-panel"):
+        yield Static("WAITING · Connecting to GPU and connector…", id="health-status", markup=False)
+        yield Static("Source: connecting | No samples yet", id="source-status", markup=False)
+        yield Static("", id="stress-status", markup=False)
+        with TabbedContent(id="views"):
+            with TabPane("Monitor (m)", id="monitor"):
+                with VerticalScroll(id="monitor-scroll"):
+                    yield Static("", id="recovery", markup=False)
+                    with Grid(id="pin-row"):
+                        for i in range(1, NUM_PINS + 1):
+                            yield PinGauge(pin_number=i, id=f"pin-{i}")
+                    yield Static("Connector: waiting for readings", id="summary", markup=False)
+                    yield Static("GPU: waiting for readings", id="gpu-stats", markup=False)
+                    yield TemperaturePanel(id="temperature")
+                    yield Static("g: switch graph · a: active conditions and connection details", id="graph-hint", markup=False)
+                    yield PlotextPlot(id="power-graph")
+                    yield PlotextPlot(id="vram-graph")
+                    yield PlotextPlot(id="temp-graph")
+                    yield Static(self._latest_event, id="latest-event", markup=False)
+            with ProcessPane("Processes (x)", id="processes"):
                 yield DataTable(id="process-table", cursor_type="row")
-            with Vertical(id="right-panel"):
-                with Horizontal(id="pin-row"):
-                    for i in range(1, NUM_PINS + 1):
-                        yield PinGauge(pin_number=i, id=f"pin-{i}")
-                yield Static("Total: -- A  -- W  |  Avg Voltage: -- V", id="summary")
-                yield Static("GPU: --", id="gpu-stats", markup=True)
-                yield PlotextPlot(id="power-graph")
-                yield PlotextPlot(id="vram-graph")
-                yield PlotextPlot(id="temp-graph")
+                yield Static("↑/↓ select · k: confirm termination", classes="page-hint", markup=False)
+            with TabPane("Event history (e)", id="events"):
+                yield Static("History only · r clears history · a shows current conditions", classes="page-hint", markup=False)
                 yield RichLog(id="alert-log", markup=True, wrap=True)
-        yield Static("", id="kill-confirm")
+        yield Static("", id="kill-confirm", markup=False)
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#process-table", DataTable)
-        table.add_columns("PID", "Name", "VRAM (MB)", "GPU %")
+        table = self._ui("#process-table", DataTable)
+        table.add_column("PID", width=7, key="pid")
+        table.add_column("Name", width=max(20, self.size.width - 33), key="name")
+        table.add_column("VRAM (MB)", width=9, key="vram")
+        table.add_column("GPU %", width=5, key="util")
         table.border_title = "GPU Processes"
-        self.query_one("#alert-log", RichLog).border_title = "Alerts"
+        self._ui("#alert-log", RichLog).border_title = "Event history"
+        self.set_interval(REFRESH_INTERVAL, self._tick)
+        self._layout()
         self._start_reader()
+
+    def _ui(self, selector, widget_type=None):
+        """Update the dashboard even while a control modal is open."""
+        return self.screen_stack[0].query_one(selector, widget_type)
+
+    def _layout(self) -> None:
+        if not self.is_running:
+            return
+        wide = self.size.width >= 140
+        views = self._ui("#views", TabbedContent)
+        pane = self._ui("#processes")
+        if wide != self._wide_processes:
+            self._cancel_kill()
+            self._wide_processes = wide
+            if wide:
+                if views.active == "processes":
+                    views.active = "monitor"
+                views.hide_tab("processes")
+            else:
+                views.show_tab("processes")
+                if self._ui("#process-table").has_focus:
+                    views.active = "processes"
+        pane.styles.dock = "left" if wide else "none"
+        pane.styles.width = 40 if wide else "100%"
+        pane.styles.margin = (0, 2, 0, 0) if wide else (0, 0, 0, 0)
+        pane.display = wide or views.active == "processes"
+        snap = self._last_snapshot
+        pins = bool(snap and snap.connector and not self._stale)
+        pin_grid = self._ui("#pin-row")
+        pin_grid.display = pins
+        # Reserve room for the scroll bar; keep labels and readings unwrapped.
+        width = max(1, self.size.width - (42 if wide else 0) - 2)
+        columns = 6 if width >= 108 else 3 if width >= 60 else 2 if width >= 32 else 1
+        pin_grid.styles.grid_size_columns = columns
+        pin_grid.styles.grid_size_rows = (NUM_PINS + columns - 1) // columns
+        gpu = bool(snap and snap.gpu and not self._stale)
+        for name in ("power", "vram", "temp"):
+            widget = self._ui(f"#{name}-graph")
+            widget.display = gpu
+        self._ui("#graph-hint", Static).update("Scroll for graphs · g: next graph · a: details")
+        table = self._ui("#process-table", DataTable)
+        if table.columns:
+            table.cell_padding = 0 if wide else 1
+            table.columns["pid"].width = 8 if wide else 7
+            table.columns["name"].width = 14 if wide else max(20, self.size.width - 33)
+            table.refresh(layout=True)
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
+        if event.tabbed_content.id == "views":
+            self._cancel_kill()
+            self._layout()
+
+    def on_resize(self) -> None:
+        if self.is_running and self.screen_stack and list(self.screen_stack[0].query("#views")):
+            self._layout()
+
+    def action_show_monitor(self):
+        self._ui("#views", TabbedContent).active = "monitor"
+
+    def action_show_processes(self):
+        self._ui("#views", TabbedContent).active = "monitor" if self._wide_processes else "processes"
+        self._ui("#process-table", DataTable).focus()
+
+    def action_show_events(self):
+        self._ui("#views", TabbedContent).active = "events"
+        self._ui("#alert-log", RichLog).focus()
+
+    def action_cycle_graph(self):
+        self._graph_index = (self._graph_index + 1) % 3
+        self.action_show_monitor()
+        name = ("power", "vram", "temp")[self._graph_index]
+        self._ui(f"#{name}-graph").scroll_visible(animate=False, top=True)
+
+    def _log_event(self, message: str) -> None:
+        self._latest_event = message
+        if self.is_running:
+            stamp = time_mod.strftime("%H:%M:%S")
+            self._ui("#alert-log", RichLog).write(Text(f"{stamp} {message}"))
+            self._ui("#latest-event", Static).update(f"Latest: {message}")
+
+    def _tick(self) -> None:
+        self._poll_stress()
+        snap = self._last_snapshot
+        if snap and time_mod.time() - snap.timestamp > 5 and not self._stale:
+            self._stale = True
+            self._power_history.clear()
+            self._vram_history.clear()
+            self._temp_history.clear()
+            self._ui("#summary", Static).update("Connector readings stale — waiting for fresh data")
+            self._ui("#gpu-stats", Static).update("GPU readings stale — waiting for fresh data")
+            self._ui("#temperature", TemperaturePanel).clear_reading("Stale · waiting for fresh data")
+            self._layout()
+        self._update_status()
+
+    def _update_status(self):
+        snap = self._last_snapshot
+        if not snap:
+            return
+        age = lambda key: (f"{max(0, time_mod.time() - self._last_good[key]):.0f}s ago"
+                           if key in self._last_good else "never")
+        source = "Daemon" if snap.source == "daemon" else f"Direct (I2C {self._i2c_bus}, NVML)"
+        self._source_text = f"{source} | Last good: pins {age('connector')}, GPU {age('gpu')}"
+        self._ui("#source-status", Static).update(self._source_text)
+        missing = []
+        if snap.connector is None:
+            missing.append("connector")
+        if snap.gpu is None:
+            missing.append("GPU")
+        alerts = sorted(self._last_alerts.values(), key=lambda a: not a.startswith("ALERT"))
+        critical = sum(a.startswith("ALERT") for a in alerts)
+        if self._stale:
+            headline = "STALE · No fresh samples · a: connection details"
+        elif missing:
+            headline = f"UNAVAILABLE · {', '.join(missing)} · retrying · a: details"
+        elif critical:
+            headline = f"ALERT · {critical} critical / {len(alerts)-critical} warnings · a: all conditions"
+        elif alerts:
+            headline = f"WARN · {len(alerts)} active warnings · a: all conditions"
+        else:
+            headline = "NORMAL · No active warnings"
+        detail = alerts[0] if alerts else "All reported readings are within configured thresholds."
+        if (missing or self._stale) and alerts:
+            detail = "Last known: " + detail
+        elif missing or self._stale:
+            detail = "Health cannot be confirmed until readings return."
+        if not alerts and snap.connector and not self._stale:
+            pin = max(snap.connector.pins, key=lambda p: p.current, default=None)
+            if pin:
+                detail += f" Highest: Pin {pin.pin} {pin.current:.2f}A."
+        color = "red" if critical else "yellow" if alerts or missing or self._stale else "green"
+        self._ui("#health-status", Static).update(Text(headline + "\n" + detail, style=color))
+        reasons = [f"{key}: {value}" for key, value in snap.errors.items()]
+        recovery = self._ui("#recovery", Static)
+        recovery.display = bool(missing or self._stale)
+        recovery.update("; ".join(reasons) if reasons else "Waiting for readings. Check I2C permissions / NVIDIA driver. Press a for details.")
+
+    def action_conditions(self):
+        snap = self._last_snapshot
+        status = "Last known conditions (readings incomplete/stale)" if (
+            self._stale or not snap or snap.connector is None or snap.gpu is None
+        ) else "Active conditions"
+        lines = [status, "", *self._last_alerts.values()]
+        if not self._last_alerts:
+            lines.append("No reported warnings." if snap and snap.gpu else "Waiting for sensor readings.")
+        lines += ["", "Connection and recovery", self._source_text]
+        if snap:
+            lines.extend(f"{key}: {value}" for key, value in snap.errors.items())
+        lines += ["Polling retries automatically. If the daemon stalls, direct reads take over.",
+                  f"Connector: check /dev/i2c-{self._i2c_bus} permissions and the selected bus.",
+                  "GPU: check NVIDIA driver availability with nvidia-smi.", "", "Thresholds",
+                  "Pin current: WARN 7.5A / ALERT 9.2A; voltage: 10–13V."]
+        if self._thermal_profile:
+            lines.append(f"GPU temperature: WARN {self._thermal_profile['temp_warn']}C / ALERT {self._thermal_profile['temp_alarm']}C.")
+        if self._power_profile:
+            lines.append(f"GPU power: WARN {self._power_profile['power_warn_watts']}W / ALERT {self._power_profile['power_alarm_watts']}W.")
+        self.push_screen(DetailsModal("\n".join(lines)))
 
     @work(exclusive=True, thread=True)
     def _start_reader(self) -> None:
         """Background thread: try daemon socket, fall back to direct reads."""
         import time
+        from textual.worker import get_current_worker, NoActiveWorker
+
+        try:
+            worker = get_current_worker()
+        except NoActiveWorker:
+            worker = None
 
         socket_path = get_socket_path()
 
         # Try daemon socket first
+        s = None
         try:
             import socket as sock_mod
             s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            s.settimeout(2.0)
             s.connect(socket_path)
             logger.info("Connected to daemon socket")
             buf = b""
             try:
-                while True:
+                while worker is None or not worker.is_cancelled:
                     chunk = s.recv(4096)
                     if not chunk:
                         break
@@ -186,21 +379,24 @@ class GpuPowerMonitorApp(App):
                         if line:
                             try:
                                 snap = MonitorSnapshot.from_json(line.decode())
+                                snap.source = "daemon"
                                 self.call_from_thread(self._apply_snapshot, snap)
                             except Exception as e:
                                 logger.debug(f"Bad snapshot: {e}")
             finally:
                 s.close()
         except (OSError, ConnectionRefusedError, FileNotFoundError):
+            if s is not None:
+                s.close()
             logger.info("Daemon not available, falling back to direct reads")
+
+        if worker is not None and worker.is_cancelled:
+            return
 
         # Direct polling fallback
         from ..i2c import IT8915Reader
         from ..gpu import GpuMonitor
-        from ..config import (
-            CURRENT_ALERT_THRESHOLD, CURRENT_WARN_THRESHOLD,
-            VOLTAGE_MIN, VOLTAGE_MAX, TEMP_WARN_THRESHOLD, TEMP_ALERT_THRESHOLD,
-        )
+        from ..daemon import _read_snapshot
 
         i2c_reader = IT8915Reader(
             bus=self._i2c_bus,
@@ -220,78 +416,8 @@ class GpuPowerMonitorApp(App):
         self._gpu_monitor = gpu_mon
 
         try:
-            while True:
-                try:
-                    connector = i2c_reader.read_pins()
-                except Exception:
-                    connector = None
-                try:
-                    gpu = gpu_mon.read_stats()
-                except Exception:
-                    gpu = None
-
-                try:
-                    processes = gpu_mon.get_processes()
-                except Exception:
-                    processes = []
-
-                snap = MonitorSnapshot(connector=connector, gpu=gpu, processes=processes)
-                if connector:
-                    for pin in connector.pins:
-                        if pin.current >= CURRENT_ALERT_THRESHOLD:
-                            snap.alerts.append(
-                                f"ALERT: {pin.label} current {pin.current:.2f}A exceeds {CURRENT_ALERT_THRESHOLD}A limit"
-                            )
-                        elif pin.current >= CURRENT_WARN_THRESHOLD:
-                            snap.alerts.append(
-                                f"WARN: {pin.label} current {pin.current:.2f}A exceeds {CURRENT_WARN_THRESHOLD}A warning"
-                            )
-                        volts = pin.voltage
-                        if volts > 0 and volts < VOLTAGE_MIN:
-                            snap.alerts.append(
-                                f"ALERT: {pin.label} voltage {volts:.2f}V below {VOLTAGE_MIN}V minimum"
-                            )
-                        elif volts > VOLTAGE_MAX:
-                            snap.alerts.append(
-                                f"ALERT: {pin.label} voltage {volts:.2f}V above {VOLTAGE_MAX}V maximum"
-                            )
-                if gpu:
-                    temp = gpu.temperature
-                    if temp >= TEMP_ALERT_THRESHOLD:
-                        snap.alerts.append(
-                            f"ALERT: GPU temperature {temp}C exceeds {TEMP_ALERT_THRESHOLD}C limit"
-                        )
-                    elif temp >= TEMP_WARN_THRESHOLD:
-                        snap.alerts.append(
-                            f"WARN: GPU temperature {temp}C exceeds {TEMP_WARN_THRESHOLD}C warning"
-                        )
-
-                    # Model-specific power thresholds
-                    if gpu.name:
-                        power_profile, _ = get_gpu_profile(gpu.name)
-                        pw = gpu.power_draw
-                        if pw >= power_profile["power_alarm_watts"]:
-                            snap.alerts.append(
-                                f"ALERT: GPU power {pw:.0f}W exceeds {power_profile['power_alarm_watts']}W alarm threshold"
-                            )
-                        elif pw >= power_profile["power_warn_watts"]:
-                            snap.alerts.append(
-                                f"WARN: GPU power {pw:.0f}W exceeds {power_profile['power_warn_watts']}W warning threshold"
-                            )
-
-                # Cross-validation: connector power vs GPU reported power
-                if connector and gpu:
-                    connector_power = connector.total_power
-                    gpu_power = gpu.power_draw
-                    if connector_power > 50 and gpu_power > 50:
-                        diff = abs(connector_power - gpu_power)
-                        avg = (connector_power + gpu_power) / 2
-                        if diff / avg > 0.20:
-                            snap.alerts.append(
-                                f"WARN: Connector power ({connector_power:.0f}W) vs GPU reported ({gpu_power:.0f}W) "
-                                f"differ by {diff:.0f}W ({diff/avg*100:.0f}%) - possible measurement discrepancy"
-                            )
-
+            while worker is None or not worker.is_cancelled:
+                snap = _read_snapshot(i2c_reader, gpu_mon)
                 self.call_from_thread(self._apply_snapshot, snap)
                 time.sleep(REFRESH_INTERVAL)
         finally:
@@ -303,8 +429,7 @@ class GpuPowerMonitorApp(App):
         try:
             self._apply_snapshot_inner(snap)
         except Exception:
-            # Guard against NoMatches during screen transitions
-            pass
+            logger.exception("Could not display snapshot")
 
     def _render_graph(
         self, widget_id: str, history: deque, title: str, ylabel: str,
@@ -313,7 +438,7 @@ class GpuPowerMonitorApp(App):
         show_xlabel: bool = True,
     ) -> None:
         """Render a PlotextPlot with a fixed time-based X axis (seconds ago)."""
-        plot_widget = self.query_one(widget_id, PlotextPlot)
+        plot_widget = self._ui(widget_id, PlotextPlot)
         p = plot_widget.plt
         p.clear_data()
         p.clear_figure()
@@ -342,7 +467,8 @@ class GpuPowerMonitorApp(App):
 
         p.xlim(-max_seconds, 0)
         if ylim_max is not None:
-            p.ylim(0, ylim_max)
+            ceiling = max(ylim_max, max(history, default=0), max((v for v, _ in thresholds or []), default=0))
+            p.ylim(0, ceiling * 1.05 if thresholds else max(1, ceiling))
         p.yfrequency(5)
 
         # Draw threshold lines
@@ -368,14 +494,20 @@ class GpuPowerMonitorApp(App):
         plot_widget.refresh()
 
     def _apply_snapshot_inner(self, snap: MonitorSnapshot) -> None:
+        self._last_snapshot = snap
+        self._stale = False
+        if snap.connector:
+            self._last_good["connector"] = snap.timestamp
+        if snap.gpu:
+            self._last_good["gpu"] = snap.timestamp
         if snap.connector:
             if not self._connector_visible:
                 self._connector_visible = True
-                self.query_one("#pin-row").styles.display = "block"
-                self.query_one("#summary").styles.display = "block"
+                self._ui("#pin-row").styles.display = "block"
+                self._ui("#summary").styles.display = "block"
             for pin in snap.connector.pins:
                 try:
-                    gauge = self.query_one(f"#pin-{pin.pin}", PinGauge)
+                    gauge = self._ui(f"#pin-{pin.pin}", PinGauge)
                     gauge.update_reading(pin)
                 except Exception:
                     pass
@@ -384,11 +516,17 @@ class GpuPowerMonitorApp(App):
             total_w = snap.connector.total_power
             voltages = [p.voltage for p in snap.connector.pins if p.voltage > 0]
             avg_v = sum(voltages) / len(voltages) if voltages else 0
-            self.query_one("#summary", Static).update(
-                f"Total: {total_a:.2f} A  {total_w:.1f} W  |  Avg Voltage: {avg_v:.3f} V"
+            self._ui("#summary", Static).update(
+                f"Connector: {total_a:.2f} A  {total_w:.1f} W  |  Avg voltage: {avg_v:.2f} V"
             )
+        else:
+            self._connector_visible = False
+            self._ui("#pin-row").styles.display = "none"
+            self._ui("#summary", Static).update("Connector readings unavailable")
 
         if snap.gpu:
+            for widget_id in ("#power-graph", "#vram-graph", "#temp-graph"):
+                self._ui(widget_id).styles.display = "block"
             g = snap.gpu
             if g.name:
                 self.sub_title = g.name
@@ -396,8 +534,6 @@ class GpuPowerMonitorApp(App):
                     _, self._thermal_profile = get_gpu_profile(g.name)
                 if self._power_profile is None:
                     self._power_profile, _ = get_gpu_profile(g.name)
-            vram_pct = round(g.vram_used / g.vram_total * 100) if g.vram_total else 0
-
             # Build throttle indicator
             throttle_str = ""
             if g.throttle_reasons:
@@ -416,43 +552,16 @@ class GpuPowerMonitorApp(App):
                             short.append(r)
                     throttle_str = f"  THROTTLE: {','.join(dict.fromkeys(short))}"
 
-            # Power color
-            pwr_pct = g.power_draw / g.power_limit if g.power_limit else 0
-            if pwr_pct >= 0.9:
-                pwr_color = "red bold"
-            elif pwr_pct >= 0.7:
-                pwr_color = "yellow"
-            else:
-                pwr_color = "green"
-
-            # Temp color
-            if self._thermal_profile:
-                if g.temperature >= self._thermal_profile.get("temp_alarm", 85):
-                    tmp_color = "red bold"
-                elif g.temperature >= self._thermal_profile.get("temp_warn", 80):
-                    tmp_color = "yellow"
-                else:
-                    tmp_color = "green"
-            else:
-                tmp_color = "green" if g.temperature < 80 else ("yellow" if g.temperature < 85 else "red bold")
-
-            # Fan color (high fan = thermal stress indicator)
-            fan_color = "green" if g.fan_speed < 70 else ("yellow" if g.fan_speed < 90 else "red")
-
-            # Throttle - make it very visible
-            if throttle_str:
-                throttle_markup = f"  [red bold reverse]{throttle_str.strip()}[/]"
-            else:
-                throttle_markup = ""
-
             gpu_text = (
-                f"Power [{pwr_color}]{g.power_draw:.0f}/{g.power_limit:.0f}W[/]  |  "
-                f"Temp [{tmp_color}]{g.temperature}C[/]  Fan [{fan_color}]{g.fan_speed}%[/]  |  "
-                f"GPU {g.util_gpu}%  Mem {g.util_memory}%{throttle_markup}\n"
-                f"Core {g.clock_graphics}MHz  Mem {g.clock_memory}MHz  |  "
-                f"VRAM {g.vram_used}/{g.vram_total}MB ({vram_pct}%)"
+                f"GPU {g.util_gpu}%   Power {g.power_draw:.0f} / {g.power_limit:.0f} W   "
+                f"VRAM {g.vram_used/1024:.1f} / {g.vram_total/1024:.1f} GiB\n"
+                f"Fan {g.fan_speed}%   Core {g.clock_graphics} MHz   Memory {g.clock_memory} MHz"
+                f"{throttle_str}"
             )
-            self.query_one("#gpu-stats", Static).update(gpu_text)
+            self._ui("#gpu-stats", Static).update(gpu_text)
+            self._ui("#temperature", TemperaturePanel).update_reading(
+                g.temperature, self._thermal_profile or get_gpu_profile(g.name)[1],
+            )
 
             # Feed line graphs
             self._power_history.append(g.power_draw)
@@ -490,12 +599,21 @@ class GpuPowerMonitorApp(App):
                 show_xlabel=False,
             )
 
-        # Update process table — merge nvml/nvidia-smi data with tracked stress tests
-        # Cache non-empty process lists so we don't flicker when nvidia-smi is slow
-        if snap.processes:
-            self._last_processes = snap.processes
+        else:
+            self._ui("#gpu-stats", Static).update("GPU readings unavailable")
+            self._ui("#temperature", TemperaturePanel).clear_reading("GPU readings unavailable")
+            # Discard history across a gap so old samples aren't shown as current.
+            self._power_history.clear()
+            self._vram_history.clear()
+            self._temp_history.clear()
+            for widget_id in ("#power-graph", "#vram-graph", "#temp-graph"):
+                self._ui(widget_id).styles.display = "none"
 
-        table = self.query_one("#process-table", DataTable)
+        # Update process table — merge nvml/nvidia-smi data with tracked stress tests
+        # Empty snapshots also replace old rows; tracked stress tests stay below.
+        self._last_processes = snap.processes
+
+        table = self._ui("#process-table", DataTable)
         now = time_mod.time()
         seen_pids: set[int] = set()
 
@@ -503,13 +621,11 @@ class GpuPowerMonitorApp(App):
         rows: list[tuple[str, str, str, str]] = []
 
         # Tracked stress tests first (always show, never flicker)
+        self._poll_stress()
         dead_pids = []
         for pid, info in self._stress_tests.items():
             # poll() reaps zombies; returns None if still running
-            if info.popen is not None and info.popen.poll() is not None:
-                dead_pids.append(pid)
-                continue
-            elif info.popen is None:
+            if info.popen is None:
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
@@ -518,7 +634,7 @@ class GpuPowerMonitorApp(App):
             seen_pids.add(pid)
             remaining = max(0, info.duration - (now - info.start_time))
             mins, secs = divmod(int(remaining), 60)
-            name = f"{info.label} ({mins}:{secs:02d})"
+            name = f"{info.label}: {info.state} ({mins}:{secs:02d})"
             # Try to get VRAM from cached process data
             vram_str = "--"
             for proc in self._last_processes:
@@ -543,12 +659,19 @@ class GpuPowerMonitorApp(App):
         needs_rebuild = new_keys != old_keys
 
         if needs_rebuild:
+            selected = None
+            if table.row_count and table.cursor_row < table.row_count:
+                selected = table.get_row_at(table.cursor_row)[0]
             table.clear()
             if rows:
                 for pid_str, name, vram_str, util_str in rows:
                     table.add_row(pid_str, name, vram_str, util_str, key=pid_str)
+                if selected in new_keys:
+                    table.move_cursor(row=new_keys.index(selected))
             else:
                 table.add_row("--", "No GPU processes", "--".rjust(7), "--".rjust(5))
+            if self._kill_confirm_pid is not None and str(self._kill_confirm_pid) not in new_keys:
+                self._cancel_kill()
         else:
             # Update cell values in place (no flicker)
             for idx, (pid_str, name, vram_str, util_str) in enumerate(rows):
@@ -557,60 +680,122 @@ class GpuPowerMonitorApp(App):
                     col_key = table.ordered_columns[col_idx].key
                     table.update_cell(row_key, col_key, val)
 
-        # Deduplicate alerts: only log alerts that weren't in the previous cycle
-        current_alerts = set(snap.alerts)
-        new_alerts = current_alerts - self._last_alerts
+        current_alerts = {_alert_key(a): a for a in snap.alerts}
+        for key, old in self._last_alerts.items():
+            # An unreadable sensor cannot prove that its previous fault resolved.
+            unknown = ((key.startswith("Pin ") and snap.connector is None)
+                       or (key.startswith("GPU ") and snap.gpu is None)
+                       or (key == "Connector power" and (snap.gpu is None or snap.connector is None)))
+            if unknown:
+                current_alerts.setdefault(key, old)
+            elif key not in current_alerts:
+                self._log_event(f"RESOLVED: {key}")
+        for key, alert in current_alerts.items():
+            old = self._last_alerts.get(key)
+            if old is None or old.split(":", 1)[0] != alert.split(":", 1)[0]:
+                self._log_event(alert)
         self._last_alerts = current_alerts
-        if new_alerts:
-            log = self.query_one("#alert-log", RichLog)
-            from datetime import datetime
-            ts = datetime.fromtimestamp(snap.timestamp).strftime("%H:%M:%S")
-            for alert in snap.alerts:
-                if alert in new_alerts:
-                    color = "red" if alert.startswith("ALERT") else "yellow"
-                    log.write(f"[{color}][{ts}] {alert}[/{color}]")
+        self._update_status()
+        self._layout()
 
     def action_clear_log(self) -> None:
-        self.query_one("#alert-log", RichLog).clear()
+        self._ui("#alert-log", RichLog).clear()
+        self._ui("#latest-event", Static).update("History cleared. Active conditions are still shown above [a].")
 
     def action_stress_test(self) -> None:
         def on_dismiss(result: tuple[object, str] | None) -> None:
             if result is not None:
                 popen, preset_key = result
                 preset = _STRESS_PRESETS[preset_key]
-                self._stress_tests[popen.pid] = _StressInfo(
+                info = _StressInfo(
                     start_time=time_mod.time(),
                     duration=preset["duration"],
                     label=preset["label"],
                     popen=popen,
+                    state="Starting",
+                    output_done=threading.Event(),
                 )
-                self.notify(f"Started {preset['label']} (PID {popen.pid})")
+                self._stress_tests[popen.pid] = info
+
+                def read_output():
+                    try:
+                        if popen.stdout is not None:
+                            for line in popen.stdout:
+                                info.output.put(line.strip())
+                    finally:
+                        if popen.stdout is not None:
+                            popen.stdout.close()
+                        info.output_done.set()
+
+                threading.Thread(target=read_output, daemon=True).start()
+                self._stress_message(f"Starting {preset['label']} (PID {popen.pid})…")
         self.push_screen(StressTestModal(), callback=on_dismiss)
+
+    def _stress_message(self, message: str):
+        self._log_event(message)
+        if self.is_running:
+            widget = self._ui("#stress-status", Static)
+            widget.display = True
+            widget.update(message)
+
+    def _poll_stress(self):
+        for pid, info in list(self._stress_tests.items()):
+            while True:
+                try:
+                    line = info.output.get_nowait()
+                except queue.Empty:
+                    break
+                if line == "GPU_POWER_MONITOR_RUNNING":
+                    info.state = "Running"
+                    info.start_time = time_mod.time()
+                    self._stress_message(f"Running {info.label} (PID {pid}) · x then k to stop")
+                elif line:
+                    info.tail.append(line)
+            code = info.popen.poll() if info.popen is not None else None
+            if code is None or (info.output_done is not None and not info.output_done.is_set()):
+                continue
+            if info.stopping:
+                result = f"Stopped {info.label} (PID {pid})"
+            elif code == 0:
+                result = f"Completed {info.label} (PID {pid})"
+            else:
+                reason = info.tail[-1] if info.tail else f"process exited with code {code}"
+                result = f"FAILED {info.label}: {reason}"
+            self._stress_message(result)
+            del self._stress_tests[pid]
 
     def action_power_limit(self) -> None:
         """Open the power limit configuration modal."""
-        if not self._gpu_monitor:
-            self.notify("GPU monitor not available", severity="error")
-            return
-        constraints = self._gpu_monitor.get_power_limit_constraints()
+        gpu_mon = self._gpu_monitor or self._control_monitor
+        if gpu_mon is None:
+            from ..gpu import GpuMonitor
+
+            gpu_mon = GpuMonitor()
+            try:
+                gpu_mon.open()
+            except Exception as e:
+                gpu_mon.close()
+                self.notify(f"Could not open GPU controls: {e}", severity="error")
+                return
+            self._control_monitor = gpu_mon
+
+        constraints = gpu_mon.get_power_limit_constraints()
         if not constraints:
             self.notify("Could not query power limit constraints", severity="error")
             return
         # Get current enforced limit
-        stats = self._gpu_monitor.read_stats()
+        stats = gpu_mon.read_stats()
         current_limit = stats.power_limit if stats else constraints.default_watts
 
         def on_dismiss(watts: float | None) -> None:
             if watts is not None:
-                success, msg = self._gpu_monitor.set_power_limit(watts)
+                success, msg = gpu_mon.set_power_limit(watts)
                 if success:
                     self.notify(msg)
-                    log = self.query_one("#alert-log", RichLog)
-                    log.write(f"[green]{msg}[/green]")
+                    self._log_event(msg)
                 else:
                     self.notify(msg, severity="error")
-                    log = self.query_one("#alert-log", RichLog)
-                    log.write(f"[red]Power limit error: {msg}[/red]")
+                    self._log_event(f"Power limit error: {msg}")
 
         self.push_screen(
             PowerLimitModal(constraints, current_limit),
@@ -618,8 +803,13 @@ class GpuPowerMonitorApp(App):
         )
 
     def action_kill_process(self) -> None:
-        """Kill the selected GPU process (with confirmation)."""
-        table = self.query_one("#process-table", DataTable)
+        """Terminate the selected GPU process (with named confirmation)."""
+        if (self._wide_processes and not self._ui("#process-table").has_focus) or (
+            not self._wide_processes and self._ui("#views", TabbedContent).active != "processes"
+        ):
+            self.action_show_processes()
+            return
+        table = self._ui("#process-table", DataTable)
         if table.row_count == 0:
             return
         row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
@@ -629,43 +819,55 @@ class GpuPowerMonitorApp(App):
             pid = int(row_key.value)
         except (ValueError, TypeError):
             return
-        confirm_bar = self.query_one("#kill-confirm", Static)
+        confirm_bar = self._ui("#kill-confirm", Static)
+        tracked = self._stress_tests.get(pid)
+        name = tracked.label if tracked else str(table.get_row(row_key)[1])
 
-        if self._kill_confirm_pid == pid:
+        if self._kill_confirm_pid == pid and self._kill_confirm_name == name:
             # Second press: confirmed
             try:
                 info = self._stress_tests.get(pid)
                 if info and info.popen:
                     info.popen.terminate()
-                    info.popen.wait(timeout=3)
+                    info.stopping = True
+                    info.state = "Stopping"
                 else:
                     os.kill(pid, signal.SIGTERM)
-                self._stress_tests.pop(pid, None)
-                self.notify(f"Sent SIGTERM to PID {pid}")
+                self._log_event(f"Sent SIGTERM to {name} (PID {pid})")
             except ProcessLookupError:
                 self._stress_tests.pop(pid, None)
                 self.notify(f"PID {pid} already exited", severity="warning")
             except PermissionError:
                 self.notify(f"Permission denied killing PID {pid}", severity="error")
-            self._kill_confirm_pid = None
-            confirm_bar.update("")
-            confirm_bar.styles.display = "none"
+            self._cancel_kill()
         else:
             # First press: show confirmation
             self._kill_confirm_pid = pid
-            confirm_bar.update(f"Kill PID {pid}? Press k again to confirm, any other key to cancel.")
+            self._kill_confirm_name = name
+            confirm_bar.update(f"Terminate {name} (PID {pid})?\nPress k again to send SIGTERM; any other key cancels.")
             confirm_bar.styles.display = "block"
+
+    def _cancel_kill(self):
+        self._kill_confirm_pid = None
+        self._kill_confirm_name = ""
+        self._ui("#kill-confirm", Static).update("")
+        self._ui("#kill-confirm").display = False
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted):
+        if event.data_table.id == "process-table" and self._kill_confirm_pid is not None:
+            if str(event.row_key.value) != str(self._kill_confirm_pid):
+                self._cancel_kill()
 
     def on_key(self, event) -> None:
         """Cancel kill confirmation on any key other than k."""
         if self._kill_confirm_pid is not None and event.key != "k":
-            self._kill_confirm_pid = None
-            confirm_bar = self.query_one("#kill-confirm", Static)
-            confirm_bar.update("")
-            confirm_bar.styles.display = "none"
+            self._cancel_kill()
 
     def on_unmount(self) -> None:
         """Clean up stress test subprocesses on TUI exit."""
+        if self._control_monitor is not None:
+            self._control_monitor.close()
+            self._control_monitor = None
         for pid, info in list(self._stress_tests.items()):
             try:
                 if info.popen is not None:
@@ -673,6 +875,9 @@ class GpuPowerMonitorApp(App):
                     info.popen.wait(timeout=3)
                 else:
                     os.kill(pid, signal.SIGTERM)
+            except subprocess.TimeoutExpired:
+                info.popen.kill()
+                info.popen.wait(timeout=3)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         self._stress_tests.clear()

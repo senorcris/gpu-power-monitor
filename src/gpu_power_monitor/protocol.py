@@ -69,6 +69,8 @@ class MonitorSnapshot:
     processes: list[GpuProcess] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
+    source: str = "direct"
+    errors: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> str:
         """Serialize to JSON string (newline-terminated for NDJSON)."""
@@ -94,4 +96,6 @@ class MonitorSnapshot:
             processes=processes,
             alerts=d.get("alerts", []),
             timestamp=d["timestamp"],
+            source=d.get("source", "direct"),
+            errors=d.get("errors", {}),
         )

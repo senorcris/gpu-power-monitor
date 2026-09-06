@@ -1,5 +1,12 @@
 """Tests for daemon alert logic."""
+import asyncio
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+
+from gpu_power_monitor.daemon import _broadcast
 from gpu_power_monitor.daemon import _build_alerts
+from gpu_power_monitor.config import GPU_THERMAL_DEFAULTS
 from gpu_power_monitor.protocol import (
     PinReading, ConnectorReading, GpuStats, MonitorSnapshot,
 )
@@ -26,7 +33,77 @@ def _make_gpu(**overrides):
     return GpuStats(**defaults)
 
 
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_broadcast_survives_client_changes(disconnect):
+    async def check():
+        first = Mock(drain=AsyncMock())
+        other = Mock(drain=AsyncMock())
+        clients = {first}
+
+        async def change_clients():
+            await asyncio.sleep(0)
+            if disconnect:
+                clients.discard(first)
+            else:
+                clients.add(other)
+
+        first.drain.side_effect = change_clients
+        await _broadcast(clients, b"first\n")
+        first.write.assert_called_once_with(b"first\n")
+        other.write.assert_not_called()
+        first.drain.side_effect = None
+        await _broadcast(clients, b"second\n")
+        if disconnect:
+            assert first.write.call_count == 1
+        else:
+            other.write.assert_called_once_with(b"second\n")
+
+    asyncio.run(check())
+
+
+def test_broadcast_drops_stalled_and_broken_clients():
+    async def check():
+        stalled = Mock(drain=AsyncMock())
+        broken = Mock(drain=AsyncMock(side_effect=BrokenPipeError))
+        healthy = Mock(drain=AsyncMock())
+        clients = {stalled, broken, healthy}
+
+        async def never_drains():
+            await asyncio.Event().wait()
+
+        stalled.drain.side_effect = never_drains
+        with patch("gpu_power_monitor.daemon.REFRESH_INTERVAL", 0.01):
+            await asyncio.wait_for(_broadcast(clients, b"first\n"), timeout=1)
+        assert clients == {healthy}
+        stalled.transport.abort.assert_called_once()
+        broken.transport.abort.assert_called_once()
+        healthy.transport.abort.assert_not_called()
+        await _broadcast(clients, b"second\n")
+        assert healthy.write.call_count == 2
+
+    asyncio.run(check())
+
+
 class TestBuildAlerts:
+    @pytest.mark.parametrize("model", list(GPU_THERMAL_DEFAULTS))
+    @pytest.mark.parametrize("boundary", ["below", "warn", "alarm"])
+    def test_model_thermal_thresholds(self, model, boundary):
+        profile = GPU_THERMAL_DEFAULTS[model]
+        temperature = {
+            "below": profile["temp_warn"] - 1,
+            "warn": profile["temp_warn"],
+            "alarm": profile["temp_alarm"],
+        }[boundary]
+        snap = MonitorSnapshot(None, _make_gpu(name=model, temperature=temperature))
+        thermal_alerts = [a for a in _build_alerts(snap) if "temperature" in a]
+        if boundary == "below":
+            assert thermal_alerts == []
+        else:
+            severity = "WARN" if boundary == "warn" else "ALERT"
+            assert len(thermal_alerts) == 1
+            assert thermal_alerts[0].startswith(severity)
+            assert f"{temperature}C" in thermal_alerts[0]
+
     def test_no_alerts_normal_conditions(self):
         snap = MonitorSnapshot(connector=_make_connector(), gpu=_make_gpu())
         alerts = _build_alerts(snap)

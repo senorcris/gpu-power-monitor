@@ -1,4 +1,10 @@
 import inspect
+import sys
+import weakref
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
 
 from gpu_power_monitor.tui.widgets import PinGauge, StressTestModal
 
@@ -16,6 +22,43 @@ class TestPinGauge:
 
 
 class TestStressTestModal:
+    @pytest.mark.parametrize("preset_key", ["quick", "standard", "heavy"])
+    def test_stress_loop_releases_results(self, preset_key):
+        from gpu_power_monitor.tui.widgets import _STRESS_PRESETS
+
+        preset = _STRESS_PRESETS[preset_key]
+        live_results = weakref.WeakSet()
+        peak_counts = []
+
+        class Tensor:
+            pass
+
+        def mm(a, b):
+            result = Tensor()
+            live_results.add(result)
+            peak_counts.append(len(live_results))
+            return result
+
+        torch = SimpleNamespace(
+            device=lambda name: name,
+            randn=lambda *args, **kwargs: Tensor(),
+            float32=object(), float16=object(), mm=mm,
+            cuda=SimpleNamespace(synchronize=Mock()),
+        )
+        with patch("gpu_power_monitor.tui.widgets.subprocess.Popen") as popen:
+            StressTestModal._launch(preset["duration"], preset["matrix"], preset["dtype"])
+            script = popen.call_args.args[0][2]
+
+        # Execute the actual child script without CUDA or a real subprocess.
+        with patch.dict(sys.modules, {"torch": torch}), patch(
+            "time.monotonic", side_effect=[0, 1, 2, 3, preset["duration"]]
+        ):
+            exec(script, {})
+
+        assert peak_counts == [1, 1, 1]
+        assert len(live_results) == 0
+        assert torch.cuda.synchronize.call_count == 3
+
     def test_is_modal_screen(self):
         from textual.screen import ModalScreen
         assert issubclass(StressTestModal, ModalScreen)

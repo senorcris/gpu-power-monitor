@@ -27,6 +27,7 @@ class GpuMonitor:
         self.gpu_index = gpu_index
         self._handle = None
         self._initialized = False
+        self.last_error: Optional[str] = None
         self._smi_cache: list[GpuProcess] = []
         self._smi_cache_time: float = 0
         self._vram_reserved_mb: int = 0  # driver-reserved VRAM to subtract
@@ -38,7 +39,9 @@ class GpuMonitor:
             self._initialized = True
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
             self._vram_reserved_mb = self._query_reserved_vram()
+            self.last_error = None
         except pynvml.NVMLError as e:
+            self.last_error = str(e)
             logger.error(f"Failed to initialize NVML: {e}")
             raise
 
@@ -117,6 +120,7 @@ class GpuMonitor:
             except (pynvml.NVMLError, AttributeError):
                 throttle_reasons = 0
 
+            self.last_error = None
             return GpuStats(
                 power_draw=round(power_draw, 1),
                 power_limit=round(power_limit, 1),
@@ -132,6 +136,7 @@ class GpuMonitor:
                 throttle_reasons=throttle_reasons,
             )
         except pynvml.NVMLError as e:
+            self.last_error = str(e)
             logger.warning(f"Error reading GPU stats: {e}")
             return None
 
