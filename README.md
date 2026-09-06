@@ -2,51 +2,49 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Linux](https://img.shields.io/badge/platform-Linux-FCC624.svg?logo=linux&logoColor=black)](https://github.com/senorcris/gpu-power-monitor)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**See how much power each pin of your GPU's 12V-2x6 connector is carrying—not just the total.**
+**Track the power draw on each pin of your GPU's 12V-2x6 connector.**
 
-GPU Power Monitor is an open-source Linux terminal dashboard for NVIDIA GPUs. On supported ASUS ROG cards it reads voltage and current from all six 12V power pins through the onboard IT8915FN controller. It combines those readings with NVML telemetry so you can spot uneven current distribution, overloaded pins, voltage problems, and differences between connector input power and GPU-reported power.
+GPU Power Monitor is a Linux terminal dashboard for NVIDIA GPUs. On supported ASUS ROG cards, it reads voltage and current from all six 12V power pins through the onboard IT8915FN controller. It also pulls in the usual NVML stats, including total power, temperature, clocks, utilization, VRAM, and running processes.
 
-On cards without accessible per-pin telemetry, it still works as a full NVML dashboard for power, temperature, clocks, utilization, VRAM, and GPU processes.
+If your card does not expose per-pin data, the NVML dashboard still works.
 
 ![GPU Power Monitor terminal dashboard showing six connector pin gauges and GPU history graphs](img/screenshot.svg)
 
-## Why per-pin monitoring matters
+## Why per-pin readings are useful
 
-Tools such as `nvidia-smi` report total GPU power. That total cannot show whether one connector contact is carrying substantially more current than the others.
+`nvidia-smi` reports the GPU's total power draw. It cannot tell you when one connector contact is carrying more current than the others.
 
-A 12V-2x6 connector has six +12 V power contacts. At a 9.2 A per-pin limit, a high-power card has little room for poor contact or uneven load distribution. GPU Power Monitor makes those individual rails visible on Linux and provides:
+A 12V-2x6 connector has six +12 V contacts. Each one is rated for 9.2 A, so a loose or poorly seated connection matters on a high-power card. This tool gives you a closer look at how the load is distributed.
 
-- Live voltage, current, and calculated power for each of the six pins
-- Green, yellow, and red gauges based on per-pin current thresholds
-- Total connector power compared with NVML-reported GPU power
-- Rolling power, VRAM, and temperature graphs sampled at 2 Hz
-- Alerts for pin overcurrent, abnormal voltage, high GPU power or temperature, and measurement discrepancies
-- GPU process monitoring, power-limit controls, and an optional PyTorch stress test
-- One-shot JSON and an NDJSON Unix-socket daemon for scripts and headless monitoring
+- Voltage, current, and calculated power for each pin
+- Color-coded gauges based on per-pin current thresholds
+- Connector input power compared with NVML power readings
+- Rolling power, VRAM, and temperature graphs at 2 Hz
+- Alerts for unusual current, voltage, power, and temperature
+- GPU process monitoring and power-limit controls
+- Optional PyTorch stress tests
+- JSON output and an NDJSON Unix-socket daemon
 
-This is the Linux counterpart to the per-pin visibility provided by ASUS Power Detector+ on supported Windows systems.
+ASUS offers similar per-pin readings through Power Detector+ on Windows. This project brings that data to Linux.
 
 ## Hardware support
 
-| Capability | Support |
+| Feature | Support |
 | --- | --- |
-| Per-pin 12V-2x6 telemetry | **Verified:** ASUS ROG Astral RTX 5090 LC with IT8915FN |
-| Other ASUS ROG cards with IT8915FN | May work, but needs community verification |
-| Standard GPU telemetry | NVIDIA GPUs supported by the proprietary driver and NVML |
-| AMD and Intel GPUs | Not currently supported |
+| Per-pin 12V-2x6 readings | Verified on the ASUS ROG Astral RTX 5090 LC with IT8915FN |
+| Other ASUS ROG cards with IT8915FN | May work, but still need testing |
+| Standard GPU stats | NVIDIA GPUs supported by the proprietary driver and NVML |
+| AMD and Intel GPUs | Not supported |
 
-Per-pin monitoring depends on board-level hardware and firmware; having a 12V-2x6 connector alone is not enough. Other vendors may use different controllers or expose no per-pin data. If your card responds to the probe, please share the exact model and PCI subsystem ID in a [hardware support report](https://github.com/senorcris/gpu-power-monitor/issues)—it will help expand this table.
+Per-pin support depends on the card's board design and firmware. A 12V-2x6 connector by itself does not mean the readings are available. Other vendors may use a different controller or keep this data private.
 
-## Quick start
+If the probe works on your card, please open a [hardware support report](https://github.com/senorcris/gpu-power-monitor/issues) with the model and PCI subsystem ID.
 
-Requirements:
+## Install
 
-- Linux and Python 3.11 or newer
-- An NVIDIA proprietary driver with working `nvidia-smi`
-- [`uv`](https://docs.astral.sh/uv/) for installation
-- Access to `/dev/i2c-*` for per-pin readings; not required for NVML-only mode
+You will need Linux, Python 3.11 or newer, a working NVIDIA proprietary driver, and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/senorcris/gpu-power-monitor.git
@@ -55,60 +53,60 @@ uv sync
 uv run gpu-power-monitor
 ```
 
-The dashboard starts in NVML-only mode if the connector controller cannot be opened. This makes it safe to try before configuring I2C permissions.
+The connector panel stays hidden if the app cannot open the I2C controller. The rest of the dashboard continues to work through NVML.
 
-### Enable per-pin readings
+## Enable per-pin readings
 
-First, check that Linux exposes I2C devices and probe the NVIDIA adapters:
+Check whether Linux exposes the I2C devices, then probe the NVIDIA adapters.
 
 ```bash
 ls /dev/i2c-*
 uv run gpu-power-monitor --probe
 ```
 
-I2C access normally requires root or membership in the `i2c` group:
+I2C access usually requires root or membership in the `i2c` group.
 
 ```bash
 sudo usermod -aG i2c "$USER"
 ```
 
-Log out and back in after changing group membership. Distribution-specific udev rules may also be needed. Avoid running the entire dashboard as root when group or udev permissions will do.
+Log out and back in after changing group membership. Some distributions may also need a udev rule. Use group or udev permissions instead of running the whole dashboard as root.
 
-A successful probe prints six plausible voltage/current pairs. If auto-detection finds the controller on a non-default bus, pass that bus when launching:
+A successful probe prints six sensible voltage and current pairs. If it finds the controller on another bus, pass that bus when starting the app.
 
 ```bash
 uv run gpu-power-monitor --bus 3
 ```
 
-The known protocol defaults are I2C address `0x2b`, register `0x80`, and a 24-byte read. They can be overridden for hardware research:
+The known protocol uses address `0x2b`, register `0x80`, and a 24-byte read. You can override those settings while testing other hardware.
 
 ```bash
 uv run gpu-power-monitor --bus 3 --address 0x2b --register 0x80
 ```
 
 > [!CAUTION]
-> Direct I2C access is intended for experienced Linux users. The monitor performs reads, but probing undocumented GPU buses is inherently hardware-specific. Validate results before relying on alerts; this tool is diagnostic software, not a replacement for a fully seated cable, sound hardware, or thermal inspection.
+> The monitor only reads from I2C, but undocumented GPU buses are still hardware-specific. Check that the values make sense before trusting an alert. This is a diagnostic tool, not a substitute for checking that the cable is fully seated and undamaged.
 
 ## Usage
 
 ```bash
-# Interactive terminal dashboard (default)
+# Open the terminal dashboard.
 uv run gpu-power-monitor
 
-# One newline-terminated JSON snapshot
+# Print one JSON snapshot.
 uv run gpu-power-monitor --once
 
-# Discover the controller on NVIDIA I2C adapters
+# Probe NVIDIA I2C adapters.
 uv run gpu-power-monitor --probe
 
-# Foreground daemon: streams NDJSON to connected Unix-socket clients
+# Run the NDJSON daemon in the foreground.
 uv run gpu-power-monitor --daemon
 
-# Show every option
+# List every option.
 uv run gpu-power-monitor --help
 ```
 
-The daemon listens on `/run/user/$UID/gpu-power-monitor.sock`. The TUI automatically uses it when available and falls back to polling the hardware directly when it is not.
+The daemon listens on `/run/user/$UID/gpu-power-monitor.sock`. The dashboard connects to it when available. Otherwise, it reads the hardware directly.
 
 ### Keyboard controls
 
@@ -116,47 +114,47 @@ The daemon listens on `/run/user/$UID/gpu-power-monitor.sock`. The TUI automatic
 | --- | --- |
 | `q` | Quit |
 | `r` | Clear the alert log |
-| `s` | Start a GPU stress-test preset (requires CUDA-enabled PyTorch in the environment) |
-| `p` | Change the GPU power limit (requires appropriate NVIDIA permissions) |
-| `k` | Send `SIGTERM` to the selected process; press twice to confirm |
+| `s` | Start a stress test. This requires CUDA-enabled PyTorch |
+| `p` | Change the GPU power limit. This requires NVIDIA permissions |
+| `k` | Stop the selected process. Press twice to confirm |
 
 ## How it works
 
-On the verified ASUS board, an IT8915FN monitoring controller is reachable through an NVIDIA I2C adapter. GPU Power Monitor reads 24 bytes from register `0x80` at address `0x2b`:
+On the tested ASUS card, the IT8915FN controller appears on an NVIDIA I2C adapter. The app reads 24 bytes from register `0x80` at address `0x2b`.
 
 ```text
-6 rails × 4 bytes
-└─ per rail: uint16 voltage_mV + uint16 current_mA (big-endian)
+6 rails x 4 bytes
+Each rail contains uint16 voltage_mV and uint16 current_mA in big-endian order
 ```
 
-The rail order is reversed relative to the physical pin labels: rail 0 maps to pin 6 and rail 5 maps to pin 1. Per-pin power is calculated as voltage × current, then summed for connector input power.
+Rail 0 maps to pin 6, and rail 5 maps to pin 1. The app multiplies voltage by current for each pin, then adds the six results to get connector input power.
 
 ```text
-IT8915FN over I2C ──> six pin readings ──┐
-                                         ├──> snapshot ──> TUI / JSON / daemon
-NVIDIA NVML ─────────> GPU + processes ──┘
+IT8915FN over I2C -> six pin readings --+
+                                           +-> snapshot -> TUI, JSON, or daemon
+NVIDIA NVML --------> GPU and processes --+
 ```
 
-The connector total and NVML power are measured at different points, so they are not expected to be identical. A difference greater than 20% under meaningful load is surfaced as a diagnostic warning.
+Connector input power and NVML power come from different measurement points, so the numbers will not match exactly. The app warns when they differ by more than 20 percent under load.
 
-Default alert points include:
+The default alerts cover the following conditions.
 
-- Per-pin current warning at 7.5 A and alert at 9.2 A
-- Pin voltage outside 10–13 V
-- Model-specific power and temperature thresholds for RTX 50-series cards
-- Connector-versus-NVML power difference greater than 20% when both exceed 50 W
+- Pin current above 7.5 A for a warning or 9.2 A for an alert
+- Pin voltage outside 10 to 13 V
+- Model-specific power and temperature limits for RTX 50-series cards
+- A connector and NVML power difference above 20 percent when both exceed 50 W
 
-## Help add support for more cards
+## Test another card
 
-Hardware reports are especially valuable. Open an [issue](https://github.com/senorcris/gpu-power-monitor/issues) with:
+Open an [issue](https://github.com/senorcris/gpu-power-monitor/issues) and include the following details.
 
-- Exact GPU manufacturer and model
-- Linux distribution, kernel, and NVIDIA driver version
+- The GPU manufacturer and exact model
+- Your Linux distribution, kernel, and NVIDIA driver version
 - PCI IDs from `lspci -nn -v -d 10de:`
 - Sanitized output from `uv run gpu-power-monitor --probe`
-- Whether the six readings are stable and plausible at idle and under load
+- Whether the readings stay sensible at idle and under load
 
-Please do not guess at registers by writing to an unknown I2C device. New controller support should begin with documented or independently validated read-only behavior.
+Do not write to unknown I2C registers while looking for a controller. New hardware support should start with documented or independently checked read-only behavior.
 
 ## Development
 
@@ -165,7 +163,7 @@ uv sync
 uv run pytest
 ```
 
-Contributions are welcome—particularly verified card reports, controller research, safer device detection, packaging, documentation, and tests. Please include tests for behavior changes and keep hardware access mockable so the suite can run without an NVIDIA GPU.
+Contributions are welcome. Card reports, controller research, safer detection, packaging, documentation, and tests are all useful. Keep hardware access mockable so the test suite can run without an NVIDIA GPU.
 
 ## License
 
